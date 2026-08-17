@@ -12,6 +12,17 @@ Ce projet compare plusieurs architectures de deep learning, notamment VGG16-FCN8
 - Évaluer les performances, l'incertitude et le temps d'inférence.
 - Préparer une utilisation future à bord d'un véhicule sous-marin autonome.
 
+## Dataset
+
+The dataset is not redistributed in this repository.
+Please obtain it from the original source and organize it as follows:
+
+Dataset/
+├── train_images/
+├── train_masks/
+├── test_images/
+└── test_masks/
+
 ## Modèles étudiés
 
 - VGG16-FCN8
