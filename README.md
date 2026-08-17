@@ -134,7 +134,8 @@ Posidonia_Oceanica_Detection_Project/
 ├── implementation_segformerb_tutoriel.ipynb
 ├── implementation_vgg16_fcn8.ipynb
 ├── .gitignore
-└── README.md
+├── README.md
+└── requirements.txt
 ```
 
 Le dossier `Dataset/` peut être conservé localement tout en étant exclu du suivi Git à l'aide du fichier `.gitignore`.
