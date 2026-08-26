@@ -167,7 +167,7 @@ Les versions exactes des dépendances doivent être enregistrées dans le fichie
 ### 1. Cloner le dépôt
 
 ```bash
-git clone <URL_DU_DEPOT>
+git clone https://github.com/rosalie0309/Project_OCTOPUS
 cd Posidonia_Oceanica_Detection_Project
 ```
 
@@ -229,6 +229,7 @@ python app.py
 ```
 
 L'application est ensuite accessible à l'adresse locale indiquée dans le terminal.
+Pour les modèles ils faut vous rassurer qu'ils sont dans un dossier ```models``` qui doit se trouver au même niveau hiérarchique que ```Dataset```
 
 ## Génération du fichier requirements
 
