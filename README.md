@@ -219,6 +219,38 @@ implementation_segformerb_tutoriel.ipynb
 
 Ils contiennent les principales étapes d'entraînement et d'évaluation des modèles correspondants.
 
+### Fichiers de métadonnées JSON
+
+Le dépôt contient également plusieurs fichiers `*_metadata.json`
+générés lors des différentes expérimentations.
+
+Ces fichiers enregistrent notamment :
+
+- la configuration utilisée pour l'entraînement ;
+- la résolution d'entrée ;
+- la fonction de perte ;
+- le taux d'apprentissage et la taille de lot ;
+- l'époque ou l'itération correspondant au meilleur checkpoint ;
+- les métriques de validation et de test ;
+- le seuil de décision calibré sur l'ensemble de validation ;
+- les informations nécessaires à la comparaison des différentes
+  configurations expérimentales.
+
+Ils sont conservés dans le dépôt afin de fournir une trace des
+expériences réalisées et de faciliter l'analyse des résultats sans
+devoir réentraîner systématiquement les modèles.
+
+Certains fichiers JSON correspondent à des expériences réalisées avant
+les dernières évolutions du notebook et peuvent donc ne pas contenir
+tous les champs présents dans les versions les plus récentes, par
+exemple les métriques de validation calculées explicitement au seuil
+fixe de `0.5`.
+
+Ces fichiers ne doivent pas être considérés comme des paramètres à
+modifier manuellement. Lors d'une nouvelle exécution complète des
+notebooks, les fichiers de métadonnées correspondants sont générés à
+partir des résultats effectivement obtenus.
+
 ### 6. Lancer l'application Web
 
 Depuis la racine du projet :
