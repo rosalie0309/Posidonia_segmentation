@@ -22,6 +22,7 @@ from flask import Flask, request, jsonify, render_template, send_from_directory
 import csv
 import json
 import cv2
+import gc
 
 from torchvision.models import vgg16, VGG16_Weights
 import torch
@@ -40,6 +41,8 @@ TESTING_IMGS = BASE_DIR / "Dataset" / "testing" / "images"
 TESTING_MSKS = BASE_DIR / "Dataset" / "testing" / "gt_images"
 TRAINING_IMGS = BASE_DIR / "Dataset" / "training" / "images"
 TRAINING_MSKS = BASE_DIR / "Dataset" / "training" / "gt_images"
+# Dossier contenant fold0_val.csv, ..., fold4_val.csv
+VGG_FOLDS_DIR = BASE_DIR / "Dataset" / "fold_csvs"
 
 IMG_H, IMG_W = 352, 480
 N_CLASSES    = 2
@@ -50,6 +53,23 @@ DIRICHLET_UNCERTAINTY_THRESHOLD = 0.5
 
 THRESHOLD_MODE_DEFAULT = "fixed"
 UNCERTAINTY_MODE_DEFAULT = "standard"
+
+# Nettoyer la CACHE pour éviter que la RAM monte progressivement 
+def clear_model_cache():
+    """
+    Libère les modèles conservés en mémoire.
+    """
+
+    global MODELS
+
+    MODELS.clear()
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print("[CACHE] Modèles libérés de la mémoire.")
 
 
 # Détection automatique de tous les .pth dans models/
@@ -95,19 +115,91 @@ def make_model_label(pth_path):
 
     return label
 
+def checkpoint_experiment_stem(pth_path):
+    """
+    Retourne le nom de l'expérience associé à un checkpoint.
+
+    Exemples :
+      model.pth             -> model
+      model_best.pth        -> model
+      model_bestval.pth     -> model
+      model_resume.pth      -> model
+    """
+    stem = Path(pth_path).stem
+
+    for suffix in ("_bestval", "_best", "_resume"):
+        if stem.endswith(suffix):
+            return stem[:-len(suffix)]
+
+    return stem
+
+def checkpoint_priority(pth_path):
+    """
+    Priorité de sélection si plusieurs checkpoints existent
+    pour la même expérience.
+    """
+    stem = Path(pth_path).stem.lower()
+
+    if stem.endswith("_bestval"):
+        return 3
+
+    if stem.endswith("_best"):
+        return 2
+
+    if stem.endswith("_resume"):
+        return 1
+
+    return 0
+
+def checkpoint_type(pth_path):
+    stem = Path(pth_path).stem.lower()
+
+    if stem.endswith("_bestval"):
+        return "best_validation"
+
+    if stem.endswith("_best"):
+        return "best"
+
+    if stem.endswith("_resume"):
+        return "resume"
+
+    return "final"
 
 def build_models_config(models_dir):
+    """
+    Détecte les checkpoints disponibles.
+
+    Si plusieurs checkpoints correspondent à la même expérience,
+    la priorité est :
+        bestval > best > resume > final
+    """
+    selected_checkpoints = {}
+
+    for pth_path in sorted(models_dir.glob("*.pth")):
+        experiment_stem = checkpoint_experiment_stem(pth_path)
+
+        current_path = selected_checkpoints.get(experiment_stem)
+
+        if (
+            current_path is None
+            or checkpoint_priority(pth_path) > checkpoint_priority(current_path)
+        ):
+            selected_checkpoints[experiment_stem] = pth_path
+
     config = {}
 
-    for pth in sorted(models_dir.glob("*.pth")):
-        label = make_model_label(pth)
+    for experiment_stem, pth_path in sorted(selected_checkpoints.items()):
+        label = make_model_label(pth_path)
 
-        # Sécurité : si deux fichiers produisent le même label,
-        # on ajoute le nom du checkpoint pour éviter d'écraser un modèle.
         if label in config:
-            label = f"{label} ({pth.stem})"
+            label = f"{label} ({experiment_stem})"
 
-        config[label] = pth
+        config[label] = pth_path
+
+        print(
+            f"[MODEL] {label} -> {pth_path.name} "
+            f"(type={checkpoint_type(pth_path)})"
+        )
 
     return config
 
@@ -117,46 +209,71 @@ print(f"Modèles détectés : {list(MODELS_CONFIG.keys())}")
 
 
 def load_model_thresholds(models_dir):
+    """
+    Charge le seuil sélectionné sur validation pour chaque checkpoint retenu.
+    """
     thresholds = {}
-    print("\n=== DEBUG : fichiers réels dans models_dir ===")
-    for f in sorted(models_dir.iterdir()):
-        print(f"  '{f.name}'  (len={len(f.name)})")
-    print("=== FIN DEBUG ===\n")
 
-    for pth_path in models_dir.glob("*.pth"):
-        label = make_model_label(pth_path)
+    for label, pth_path in MODELS_CONFIG.items():
+        experiment_stem = checkpoint_experiment_stem(pth_path)
 
-        # Même sécurité que dans build_models_config : éviter les collisions de noms.
-        if label in thresholds:
-            label = f"{label} ({pth_path.stem})"
-
-        # Construit le nom du JSON attendu directement depuis le nom du .pth
-        # ex: "7A_segformerb0_ce_best.pth" → "7A_segformerb0_ce_metadata.json"
-        expected_json_name = pth_path.stem.replace('_best', '') + '_metadata.json'
+        expected_json_name = f"{experiment_stem}_metadata.json"
         matched_json = models_dir / expected_json_name
 
         if not matched_json.exists():
-            # Fallback : cherche un JSON dont le nom de base correspond exactement
-            base_name = pth_path.stem.replace('_best', '')
             candidates = [
-                jf for jf in models_dir.glob("*.json")
-                if jf.stem.replace('_metadata', '') == base_name
+                json_path
+                for json_path in models_dir.glob("*.json")
+                if json_path.stem.replace("_metadata", "") == experiment_stem
             ]
+
             matched_json = candidates[0] if candidates else None
 
-        if matched_json and matched_json.exists():
-            try:
-                with open(matched_json) as f:
-                    meta = json.load(f)
-                thr = meta.get('val_threshold', meta.get('test_threshold', 0.5))
-                thresholds[label] = round(float(thr), 3)
-                print(f"  Seuil chargé : {label} = {thresholds[label]} ({matched_json.name})")
-            except Exception as e:
-                print(f"  [WARN] JSON non lisible : {matched_json} — {e}")
-        else:
-            print(f"  [WARN] JSON introuvable pour : {pth_path.name} (attendu: {expected_json_name})")
+        if matched_json is None or not matched_json.exists():
+            print(
+                f"[WARN] JSON introuvable pour {pth_path.name}. "
+                f"Fichier attendu : {expected_json_name}"
+            )
+            thresholds[label] = DECISION_THRESHOLD
+            continue
+
+        try:
+            with open(matched_json, "r", encoding="utf-8") as file:
+                metadata = json.load(file)
+
+            # Seuil choisi sur validation uniquement
+            threshold = metadata.get("val_threshold")
+
+            # Compatibilité avec l'ancien format VGG16
+            if threshold is None:
+                threshold = (
+                    metadata
+                    .get("mix_metrics", {})
+                    .get("threshold")
+                )
+
+            if threshold is None:
+                print(
+                    f"[WARN] Aucun seuil de validation dans "
+                    f"{matched_json.name}; utilisation de 0.5."
+                )
+                threshold = DECISION_THRESHOLD
+
+            thresholds[label] = round(float(threshold), 3)
+
+            print(
+                f"[THRESHOLD] {label} = {thresholds[label]:.3f} "
+                f"depuis {matched_json.name}"
+            )
+
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(
+                f"[WARN] JSON non lisible : {matched_json} — {exc}"
+            )
+            thresholds[label] = DECISION_THRESHOLD
 
     return thresholds
+
 
 MODEL_THRESHOLDS = load_model_thresholds(MODELS_DIR)
 print(f"Seuils chargés : {MODEL_THRESHOLDS}")
@@ -399,8 +516,45 @@ class SegFormer(nn.Module):
 # CHARGEMENT DES MODÈLES
 # --------------------------------------------
 def load_model(name, pth_path):
-    ckpt  = torch.load(pth_path, map_location=DEVICE, weights_only=False)
-    sd    = ckpt.get('model_state_dict', ckpt.get('state_dict', ckpt))
+    """
+    Charge différents formats de checkpoints :
+
+    - {"model_state_dict": ...}
+    - {"state_dict": ...}
+    - {"model_state": ...}        # format VGG16 bestval
+    - state_dict sauvegardé directement
+    """
+    ckpt = torch.load(
+        pth_path,
+        map_location=DEVICE,
+        weights_only=False
+    )
+
+    if not isinstance(ckpt, dict):
+        raise TypeError(
+            f"Format de checkpoint non reconnu pour {pth_path.name}: "
+            f"type={type(ckpt).__name__}"
+        )
+
+    if "model_state_dict" in ckpt:
+        sd = ckpt["model_state_dict"]
+
+    elif "state_dict" in ckpt:
+        sd = ckpt["state_dict"]
+
+    elif "model_state" in ckpt:
+        sd = ckpt["model_state"]
+
+    else:
+        # Cas où le fichier contient directement le state_dict
+        sd = ckpt
+
+    if not isinstance(sd, dict):
+        raise TypeError(
+            f"Le state_dict extrait de {pth_path.name} "
+            f"n'est pas un dictionnaire."
+        )
+
     fname = pth_path.name.lower()
 
     if 'segformer' in fname:
@@ -413,16 +567,56 @@ def load_model(name, pth_path):
 
     model.load_state_dict(sd, strict=True)
     model.to(DEVICE).eval()
-    print(f"  OK: {name}")
+
+    print(
+        f"  OK: {name} | "
+        f"checkpoint={pth_path.name} | "
+        f"type={checkpoint_type(pth_path)}"
+    )
+
     return model
 
-print("=== Chargement des modèles ===")
+# ============================================================
+# CACHE DE MODÈLES
+# ============================================================
+
+print("=== Initialisation du cache modèles ===")
+
+# Les modèles ne sont plus tous chargés au démarrage.
+# Ils sont chargés uniquement lorsqu'ils sont réellement utilisés.
 MODELS = {}
-for name, path in MODELS_CONFIG.items():
-    if path.exists():
-        MODELS[name] = load_model(name, path)
-    else:
-        print(f"  KO: {name} — fichier introuvable : {path}")
+
+print(
+    f"{len(MODELS_CONFIG)} checkpoint(s) disponible(s). "
+    "Chargement à la demande."
+)
+
+def get_or_load_model(name, pth_path):
+    """
+    Charge un modèle uniquement lorsqu'il est demandé.
+
+    Le modèle est ensuite conservé dans un cache afin d'éviter
+    de recharger le même checkpoint plusieurs fois.
+    """
+
+    cache_key = str(Path(pth_path).resolve())
+
+    if cache_key in MODELS:
+        return MODELS[cache_key]
+
+    print(
+        f"[LOAD] Chargement à la demande : "
+        f"{Path(pth_path).name}"
+    )
+
+    model = load_model(
+        name,
+        Path(pth_path)
+    )
+
+    MODELS[cache_key] = model
+
+    return model
 
 # --------------------------------------------
 # UTILITAIRES IMAGE
@@ -441,6 +635,61 @@ def img_to_tensor(pil_img, img_h=None, img_w=None):
 
     img = pil_img.convert('RGB').resize((img_w, img_h), Image.BILINEAR)
     return transforms.ToTensor()(img).unsqueeze(0)
+
+def get_model_input_size(model_name, checkpoint_path=None):
+    """
+    Retourne la résolution attendue par le modèle.
+
+    VGG16-FCN8 :
+        360 x 480
+
+    SegFormer :
+        résolution lue depuis le metadata si disponible,
+        sinon 352 x 480.
+    """
+
+    name_lower = str(model_name).lower()
+
+    # --------------------------------------------------------
+    # VGG16-FCN8
+    # --------------------------------------------------------
+    if (
+        "vgg" in name_lower
+        or "fcn" in name_lower
+    ):
+        return 360, 480
+
+    # --------------------------------------------------------
+    # Recherche dans les pipelines
+    # --------------------------------------------------------
+    if checkpoint_path is not None:
+
+        pipelines = discover_pipelines(
+            MODELS_DIR
+        )
+
+        checkpoint_resolved = Path(
+            checkpoint_path
+        ).resolve()
+
+        for pipeline in pipelines.values():
+
+            pipeline_checkpoint = Path(
+                pipeline["checkpoint_path"]
+            ).resolve()
+
+            if pipeline_checkpoint == checkpoint_resolved:
+
+                img_h = pipeline.get("img_h")
+                img_w = pipeline.get("img_w")
+
+                if img_h is not None and img_w is not None:
+                    return int(img_h), int(img_w)
+
+    # --------------------------------------------------------
+    # Fallback SegFormer historique
+    # --------------------------------------------------------
+    return IMG_H, IMG_W
 
 def predict_mask(model, tensor):
     with torch.no_grad():
@@ -939,63 +1188,81 @@ matplotlib.use('Agg')  # backend sans interface graphique, requis pour Flask
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def short_label_for_plot(name):
+def short_label_for_plot(name, pipeline_info=None):
     """
-    Réduit les noms longs des pipelines pour les figures matplotlib.
-    
-    Exemple :
-    "SegFormer-B2 | CE+Dice | 352x480 | Aucun prétraitement | 7B"
-    devient :
-    "B2 CE+Dice none 7B"
+    Label propre pour les figures :
+    - SegFormer-B2 (single split)
+    - SegFormer-B2 (fold 3)
+    - VGG16-FCN8 (fold 5)
+    - Soft-voting ensemble
     """
 
     name_str = str(name)
 
+    # Cas ensemble
     if "ensemble" in name_str.lower():
         if "soft" in name_str.lower():
-            return "Ensemble soft"
+            return "Soft-voting ensemble"
         if "hard" in name_str.lower():
-            return "Ensemble hard"
+            return "Hard-voting ensemble"
         return "Ensemble"
 
-    parts = [p.strip() for p in name_str.split("|")]
+    # Cas où on a accès aux métadonnées du pipeline
+    if pipeline_info is not None:
+        architecture = str(pipeline_info.get("architecture", "")).lower()
+        variant = str(pipeline_info.get("variant", "")).lower()
+        fold = pipeline_info.get("fold", None)
 
-    if len(parts) >= 5:
-        arch = parts[0]
-        loss = parts[1]
-        resolution = parts[2]
-        preprocess = parts[3]
-        section = parts[4]
-
-        if "SegFormer-B0" in arch:
-            arch_short = "B0"
-        elif "SegFormer-B1" in arch:
-            arch_short = "B1"
-        elif "SegFormer-B2" in arch:
-            arch_short = "B2"
-        elif "VGG16-FCN8" in arch or "FCN" in arch:
-            return "VGG16-FCN8"
+        # Nom du modèle
+        if "segformer" in architecture or variant in ["b0", "b1", "b2"]:
+            if variant in ["b0", "b1", "b2"]:
+                model_label = f"SegFormer-{variant.upper()}"
+            else:
+                # fallback si variant absent
+                if "b0" in name_str.lower():
+                    model_label = "SegFormer-B0"
+                elif "b1" in name_str.lower():
+                    model_label = "SegFormer-B1"
+                elif "b2" in name_str.lower():
+                    model_label = "SegFormer-B2"
+                else:
+                    model_label = "SegFormer"
+        elif "vgg" in architecture or "fcn" in architecture or "vgg" in name_str.lower():
+            model_label = "VGG16-FCN8"
         else:
-            arch_short = arch
+            model_label = name_str
 
-        if "Aucun" in preprocess:
-            prep_short = "none"
-        elif "CLAHE" in preprocess:
-            prep_short = "CLAHE"
-        elif "Expansion" in preprocess:
-            prep_short = "ExpRGB"
+        # Fold ou single split
+        if fold is None or str(fold).lower() in ["", "none", "null", "-", "nan"]:
+            split_label = "single split"
         else:
-            prep_short = preprocess
+            split_label = f"fold {fold}"
 
-        if section == "-":
-            return f"{arch_short} {loss} {prep_short}"
+        return f"{model_label} ({split_label})"
 
-        return f"{arch_short} {loss} {prep_short} {section}"
+    # Fallback si on n'a pas les métadonnées
+    lower_name = name_str.lower()
 
-    # Cas de sécurité si le nom n'a pas le format attendu
-    return name_str[:35]
+    if "segformer-b0" in lower_name or "b0" in lower_name:
+        model_label = "SegFormer-B0"
+    elif "segformer-b1" in lower_name or "b1" in lower_name:
+        model_label = "SegFormer-B1"
+    elif "segformer-b2" in lower_name or "b2" in lower_name:
+        model_label = "SegFormer-B2"
+    elif "vgg" in lower_name or "fcn" in lower_name:
+        model_label = "VGG16-FCN8"
+    else:
+        model_label = name_str[:35]
 
-def generate_eval_figures(results_val, results_test, split_label, method, threshold, model_thresholds=None):
+    import re
+    match = re.search(r"fold[_\s-]*(\d+)", lower_name)
+    if match:
+        return f"{model_label} (fold {match.group(1)})"
+
+    return f"{model_label} (single split)"
+
+def generate_eval_figures(results_val, results_test, split_label, method, threshold,
+                          model_thresholds=None, active_pipelines=None):    
     """
     Génère :
       - 1 figure ROC+PR par modèle (val vs test), empilées verticalement
@@ -1007,7 +1274,7 @@ def generate_eval_figures(results_val, results_test, split_label, method, thresh
     n     = len(names)
     model_thresholds = model_thresholds or {}
 
-    # === FIGURE 1 : ROC + PR — une ligne par modèle ===
+    # === FIGURE 1 : ROC + PR - une ligne par modèle ===
     fig, axes = plt.subplots(n, 2, figsize=(11, 4.5*n))
     if n == 1:
         axes = axes.reshape(1, 2)
@@ -1015,7 +1282,8 @@ def generate_eval_figures(results_val, results_test, split_label, method, thresh
     for i, name in enumerate(names):
         mv, mt = results_val[name], results_test[name]
 
-        short_name = short_label_for_plot(name)
+        pipeline_info = active_pipelines.get(name) if active_pipelines else None
+        short_name = short_label_for_plot(name, pipeline_info)
 
         ax_roc = axes[i, 0]
         ax_roc.plot(
@@ -1058,8 +1326,9 @@ def generate_eval_figures(results_val, results_test, split_label, method, thresh
     roc_pr_b64 = base64.b64encode(buf1.getvalue()).decode()
 
     # === FIGURE 2 : Matrices de confusion — une ligne par modèle, VAL | TEST ===
-    fig2, axes2 = plt.subplots(n, 2, figsize=(12.5, 5.0*n))
+    fig2, axes2 = plt.subplots(n, 2, figsize=(13.5, 5.5*n))
     fig2.suptitle('Confusion Matrices - Validation and Test', fontsize=13)
+
     if n == 1:
         axes2 = axes2.reshape(1, 2)
 
@@ -1125,20 +1394,30 @@ def generate_eval_figures(results_val, results_test, split_label, method, thresh
                         fontsize=8
                     )
 
-            short_name = short_label_for_plot(name)
+            pipeline_info = active_pipelines.get(name) if active_pipelines else None
+            short_name = short_label_for_plot(name, pipeline_info)
             total_pixels = int(cm.sum())
 
             split_display = "Validation" if split_name == "VAL" else "Test"
 
             ax.set_title(
-                f"{short_name} - {split_display} - threshold={thr_display:.2f}\n"
-                f"Acc={m['accuracy']*100:.2f}% | "
-                f"Dice={m['f1']*100:.2f}% | "
-                f"mIoU={m['miou']*100:.2f}% | "
-                f"N={total_pixels:,} px".replace(",", " "),
-                fontsize=8
+                (
+                    f"{short_name} - {split_display} Set\n"
+                    f"Threshold: {thr_display:.2f}   -   "
+                    f"Accuracy: {m['accuracy'] * 100:.2f}%\n"
+                    f"Dice/F1: {m['f1'] * 100:.2f}%   -   "
+                    f"mIoU: {m['miou'] * 100:.2f}%   -  "
+                    f"N: {total_pixels:,} px"
+                ).replace(",", " "),
+                fontsize=9,
+                pad=12,
+                linespacing=1.35
             )
-    plt.tight_layout()
+    fig2.tight_layout(
+        rect=[0.02, 0.02, 0.98, 0.95],
+        h_pad=3.0,
+        w_pad=2.5
+    )
     buf2 = io.BytesIO()
     fig2.savefig(buf2, format='png', dpi=130, bbox_inches='tight')
     plt.close(fig2)
@@ -1146,13 +1425,14 @@ def generate_eval_figures(results_val, results_test, split_label, method, thresh
 
     return roc_pr_b64, cm_b64
 
-def generate_eval_figures_single(model_results, split_label, method, threshold, model_thresholds=None):
+def generate_eval_figures_single(results, split_label, method, threshold,
+                                 model_thresholds=None, active_pipelines=None):
     """
     Version pour UN SEUL split (val ou test) : grille multi-modèles.
 
     model_thresholds : dict {nom_modèle: seuil_utilisé} pour afficher le bon seuil par modèle
     """
-    names = list(model_results.keys())
+    names = list(results.keys())
     n     = len(names)
     model_thresholds = model_thresholds or {}
 
@@ -1161,8 +1441,9 @@ def generate_eval_figures_single(model_results, split_label, method, threshold, 
     fig.suptitle(f'{split_label} - {method} voting', fontsize=13)
 
     for name in names:
-        m = model_results[name]
-        short_name = short_label_for_plot(name)
+        m = results[name]
+        pipeline_info = active_pipelines.get(name) if active_pipelines else None
+        short_name = short_label_for_plot(name, pipeline_info)
 
         axes[0].plot(
             m['fpr'], m['tpr'],
@@ -1188,81 +1469,187 @@ def generate_eval_figures_single(model_results, split_label, method, threshold, 
     plt.close(fig)
     roc_pr_b64 = base64.b64encode(buf1.getvalue()).decode()
 
-    # === FIGURE 2 : Matrices de confusion — grille multi-modèles ===
-    n_cols = min(n, 3)
-    n_rows = (n + n_cols - 1) // n_cols
-    fig2, axes2 = plt.subplots(n_rows, n_cols, figsize=(5.2*n_cols, 4.8*n_rows))
-    fig2.suptitle(f'Confusion Matrices - {split_label}', fontsize=13)
+    # ==========================================================
+    # FIGURE 2 : MATRICES DE CONFUSION — VERSION LISIBLE
+    # ==========================================================
 
-    if n == 1:
-        axes2 = np.array([axes2])
-    axes2_flat = np.array(axes2).flatten()
+    names_cm = list(results.keys())
+    n_cm = len(names_cm)
 
-    for i, name in enumerate(names):
-        m  = model_results[name]
+    n_cols = min(n_cm, 3)
+    n_rows = (n_cm + n_cols - 1) // n_cols
+
+    fig2, axes2 = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(6.4 * n_cols, 6.0 * n_rows)
+    )
+
+    fig2.suptitle(
+        f"Matrices de confusion - {split_label}",
+        fontsize=18,
+        fontweight="bold",
+        y=0.99
+    )
+
+    # Fonctionne aussi lorsqu'il n'y a qu'une seule matrice
+    axes2_flat = np.array(axes2, ndmin=1).flatten()
+
+    for i, name in enumerate(names_cm):
+
+        m = results[name]
         ax = axes2_flat[i]
+
+        # Seuil réellement utilisé pour ce modèle
         thr_display = model_thresholds.get(name, threshold)
 
         if thr_display is None:
-            thr_display = DECISION_THRESHOLD # ← seuil propre au modèle
+            thr_display = DECISION_THRESHOLD
 
-        cm = np.array([[m['tn'], m['fp']], [m['fn'], m['tp']]])
-        cm_pct = cm / cm.sum(axis=1, keepdims=True) * 100
+        # Matrice :
+        # [[TN, FP],
+        #  [FN, TP]]
+        cm = np.array([
+            [m["tn"], m["fp"]],
+            [m["fn"], m["tp"]]
+        ])
+
+        # Pourcentages normalisés par classe réelle
+        row_sums = cm.sum(axis=1, keepdims=True)
+        cm_pct = np.divide(
+            cm,
+            row_sums,
+            out=np.zeros_like(cm, dtype=float),
+            where=row_sums != 0
+        ) * 100.0
 
         sns.heatmap(
-            cm_pct, annot=False, cmap='Blues', vmin=0, vmax=100,
-            cbar=False, square=True, ax=ax,
-            xticklabels=['Predicted background', 'Predicted posidonia'],
-            yticklabels=['True background', 'True posidonia'],
-            linewidths=1, linecolor='white'
+            cm_pct,
+            annot=False,
+            cmap="Blues",
+            vmin=0,
+            vmax=100,
+            cbar=False,
+            square=True,
+            ax=ax,
+            xticklabels=["Fond", "Posidonie"],
+            yticklabels=["Fond", "Posidonie"],
+            linewidths=1.5,
+            linecolor="white"
         )
+
+        # Axes beaucoup plus lisibles
+        ax.set_xlabel(
+            "Classe prédite",
+            fontsize=13,
+            fontweight="bold",
+            labelpad=10
+        )
+
+        ax.set_ylabel(
+            "Classe réelle",
+            fontsize=13,
+            fontweight="bold",
+            labelpad=10
+        )
+
+        ax.tick_params(
+            axis="both",
+            labelsize=12
+        )
+
+        ax.set_xticklabels(
+            ax.get_xticklabels(),
+            rotation=0
+        )
+
+        ax.set_yticklabels(
+            ax.get_yticklabels(),
+            rotation=0
+        )
+
+        # Valeurs dans les quatre cases
         for r in range(2):
             for c in range(2):
-                pct = cm_pct[r, c]
+
+                pct_value = cm_pct[r, c]
                 count = cm[r, c]
 
-                color = 'white' if pct > 50 else 'black'
-
-                ax.text(
-                    c + 0.5,
-                    r + 0.42,
-                    f"{pct:.1f}%",
-                    ha='center',
-                    va='center',
-                    color=color,
-                    fontsize=12,
-                    fontweight='bold'
+                text_color = (
+                    "white"
+                    if pct_value > 50
+                    else "black"
                 )
 
+                # Pourcentage
+                ax.text(
+                    c + 0.5,
+                    r + 0.40,
+                    f"{pct_value:.1f} %",
+                    ha="center",
+                    va="center",
+                    color=text_color,
+                    fontsize=17,
+                    fontweight="bold"
+                )
+
+                # Nombre de pixels
                 ax.text(
                     c + 0.5,
                     r + 0.62,
                     f"{count:,} px".replace(",", " "),
-                    ha='center',
-                    va='center',
-                    color=color,
-                    fontsize=8
+                    ha="center",
+                    va="center",
+                    color=text_color,
+                    fontsize=11
                 )
-     
-        short_name = short_label_for_plot(name)
 
-        total_pixels = int(cm.sum())
-
-        ax.set_title(
-            f"{short_name} - threshold={thr_display:.2f}\n"
-            f"accuracy={m['accuracy']*100:.2f}% | dice={m['f1']*100:.2f}% | "
-            f"mIoU={m['miou']*100:.2f}% | N={total_pixels:,} px".replace(",", " "),
-            fontsize=8
+        # Nom court du modèle
+        pipeline_info = (
+            active_pipelines.get(name)
+            if active_pipelines
+            else None
         )
 
-    for j in range(n, len(axes2_flat)):
-        axes2_flat[j].axis('off')
+        short_name = short_label_for_plot(
+            name,
+            pipeline_info
+        )
 
-    plt.tight_layout()
+        # On garde seulement l'information indispensable
+        # Les autres métriques sont déjà dans le tableau HTML
+        ax.set_title(
+            f"{short_name}\nSeuil = {thr_display:.2f}",
+            fontsize=13,
+            fontweight="bold",
+            pad=14
+        )
+
+    # Masquer les axes inutilisés si la grille n'est pas complète
+    for j in range(n_cm, len(axes2_flat)):
+        axes2_flat[j].axis("off")
+
+    fig2.tight_layout(
+        rect=[0.02, 0.02, 0.98, 0.94],
+        h_pad=3.0,
+        w_pad=3.0
+    )
+
     buf2 = io.BytesIO()
-    fig2.savefig(buf2, format='png', dpi=130, bbox_inches='tight')
+
+    fig2.savefig(
+        buf2,
+        format="png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
     plt.close(fig2)
-    cm_b64 = base64.b64encode(buf2.getvalue()).decode()
+
+    cm_b64 = base64.b64encode(
+        buf2.getvalue()
+    ).decode()
+
 
     return roc_pr_b64, cm_b64
 
@@ -1339,39 +1726,29 @@ def make_error_zones_overlay_without_uncertainty(pred, gt_mask):
 
 def load_model_from_pipeline(pipeline):
     """
-    Charge le modèle correspondant au pipeline sélectionné.
-
-    Cette fonction réutilise la fonction load_model(name, pth_path)
-    déjà définie dans app.py. Elle évite donc d'avoir à créer
-    build_segformer_model(), build_fcn8_model() ou build_unet_model().
+    Charge à la demande le modèle correspondant au pipeline.
     """
 
-    checkpoint_path = Path(pipeline["checkpoint_path"])
+    checkpoint_path = Path(
+        pipeline["checkpoint_path"]
+    )
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(
-            f"Checkpoint introuvable pour le pipeline : {checkpoint_path}"
+            f"Checkpoint introuvable : {checkpoint_path}"
         )
 
-    # Nom lisible utilisé pour l'affichage et les logs
-    label = pipeline.get("label") or pipeline.get("experiment_name") or checkpoint_path.stem
+    label = (
+        pipeline.get("label")
+        or pipeline.get("experiment_name")
+        or checkpoint_path.stem
+    )
 
-    # Si le modèle est déjà chargé dans MODELS, on le réutilise
-    # pour éviter de recharger inutilement le même checkpoint.
-    for model_name, model_path in MODELS_CONFIG.items():
-        try:
-            if Path(model_path).resolve() == checkpoint_path.resolve():
-                if model_name in MODELS:
-                    print(f"Modèle pipeline déjà chargé, réutilisation : {model_name}")
-                    return MODELS[model_name]
-        except Exception:
-            pass
+    return get_or_load_model(
+        label,
+        checkpoint_path
+    )
 
-    # Sinon, on charge le modèle avec la fonction existante
-    print(f"Chargement du modèle pipeline : {label}")
-    model = load_model(label, checkpoint_path)
-
-    return model
 
 # === CLAHE ===
 
@@ -1455,13 +1832,703 @@ def apply_pipeline_preprocess(pil_img, preprocess):
 
     return Image.fromarray(img_out.astype(np.uint8))
 
+# ============================================================
+# RECALIBRATION DES SEUILS VGG16-FCN8 BESTVAL
+# ============================================================
+
+def read_fold_validation_names(csv_path):
+    """
+    Lit les noms d'images contenus dans un CSV de validation.
+
+    Colonnes reconnues :
+      - image
+      - filename
+      - name
+      - image_path
+      - path
+
+    Les extensions et les éventuels chemins sont supprimés.
+    """
+    csv_path = Path(csv_path)
+
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"CSV de validation introuvable : {csv_path}"
+        )
+
+    image_names = []
+
+    with open(
+        csv_path,
+        "r",
+        encoding="utf-8-sig",
+        newline=""
+    ) as file:
+        reader = csv.DictReader(file)
+
+        if not reader.fieldnames:
+            raise ValueError(
+                f"Le CSV {csv_path.name} ne contient pas d'en-tête."
+            )
+
+        normalized_fields = {
+            str(field).strip().lower(): field
+            for field in reader.fieldnames
+            if field is not None
+        }
+
+        accepted_columns = (
+            "image",
+            "filename",
+            "name",
+            "image_path",
+            "path",
+        )
+
+        selected_column = next(
+            (
+                normalized_fields[column]
+                for column in accepted_columns
+                if column in normalized_fields
+            ),
+            None
+        )
+
+        if selected_column is None:
+            raise ValueError(
+                f"Aucune colonne d'image reconnue dans {csv_path.name}. "
+                f"Colonnes trouvées : {reader.fieldnames}"
+            )
+
+        for row in reader:
+            raw_value = str(
+                row.get(selected_column, "")
+            ).strip()
+
+            if not raw_value:
+                continue
+
+            # Compatible avec les chemins Windows et Unix.
+            normalized_value = raw_value.replace("\\", "/")
+            image_name = Path(normalized_value).stem
+
+            if image_name:
+                image_names.append(image_name)
+
+    # Élimination des doublons sans modifier l'ordre.
+    image_names = list(dict.fromkeys(image_names))
+
+    if not image_names:
+        raise ValueError(
+            f"Aucun nom d'image trouvé dans {csv_path.name}."
+        )
+
+    return image_names
+
+
+def find_existing_image(image_name, image_dir):
+    """
+    Retrouve une image indépendamment de son extension.
+    """
+    image_dir = Path(image_dir)
+
+    for extension in (
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".PNG",
+        ".JPG",
+        ".JPEG",
+    ):
+        candidate = image_dir / f"{image_name}{extension}"
+
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def compute_calibration_metrics(
+    probabilities,
+    labels,
+    threshold
+):
+    """
+    Calcule les métriques globales pour un seuil candidat.
+
+    Le score de sélection est :
+        (recall + specificity) / 2
+
+    Cette expression est équivalente, pour la sélection du seuil,
+    à maximiser recall - fall-out.
+    """
+    predictions = (
+        probabilities >= threshold
+    ).astype(np.uint8)
+
+    tp = int(
+        ((predictions == 1) & (labels == 1)).sum()
+    )
+    fp = int(
+        ((predictions == 1) & (labels == 0)).sum()
+    )
+    fn = int(
+        ((predictions == 0) & (labels == 1)).sum()
+    )
+    tn = int(
+        ((predictions == 0) & (labels == 0)).sum()
+    )
+
+    total = tp + fp + fn + tn
+
+    accuracy = (
+        (tp + tn) / (total + 1e-8)
+    )
+
+    precision = (
+        tp / (tp + fp + 1e-8)
+    )
+
+    recall = (
+        tp / (tp + fn + 1e-8)
+    )
+
+    fallout = (
+        fp / (fp + tn + 1e-8)
+    )
+
+    specificity = 1.0 - fallout
+
+    f1 = (
+        2.0 * precision * recall
+        / (precision + recall + 1e-8)
+    )
+
+    iou_posidonia = (
+        tp / (tp + fp + fn + 1e-8)
+    )
+
+    iou_background = (
+        tn / (tn + fp + fn + 1e-8)
+    )
+
+    miou = (
+        iou_posidonia + iou_background
+    ) / 2.0
+
+    calibration_score = (
+        recall + specificity
+    ) / 2.0
+
+    return {
+        "threshold": round(float(threshold), 4),
+        "calibration_score": float(calibration_score),
+        "recall_minus_fallout": float(
+            recall - fallout
+        ),
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "specificity": float(specificity),
+        "fallout": float(fallout),
+        "f1": float(f1),
+        "dice": float(f1),
+        "iou": float(iou_posidonia),
+        "iou_background": float(iou_background),
+        "miou": float(miou),
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+    }
+
+
+def recalibrate_one_bestval_pipeline(
+    pipeline,
+    validation_csv,
+    candidate_thresholds=None,
+):
+    """
+    Recalibre le seuil d'un checkpoint VGG16-FCN8 bestval
+    sur le sous-ensemble de validation de son fold.
+
+    Le nouveau seuil est sauvegardé dans le metadata JSON
+    correspondant au pipeline.
+    """
+    checkpoint_path = Path(
+        pipeline["checkpoint_path"]
+    )
+
+    metadata_path = Path(
+        pipeline["metadata_path"]
+    )
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint introuvable : {checkpoint_path}"
+        )
+
+    if not checkpoint_path.stem.lower().endswith(
+        "_bestval"
+    ):
+        raise ValueError(
+            f"Le checkpoint n'est pas un bestval : "
+            f"{checkpoint_path.name}"
+        )
+
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Metadata introuvable : {metadata_path}"
+        )
+
+    if candidate_thresholds is None:
+        candidate_thresholds = [
+            0.1,
+            0.2,
+            0.3,
+            0.4,
+            0.5,
+            0.6,
+            0.7,
+            0.8,
+            0.9,
+        ]
+
+    candidate_thresholds = [
+        round(float(value), 4)
+        for value in candidate_thresholds
+    ]
+
+    image_names = read_fold_validation_names(
+        validation_csv
+    )
+
+    model = load_model_from_pipeline(pipeline)
+
+    img_h = int(
+        pipeline.get("img_h") or 360
+    )
+    img_w = int(
+        pipeline.get("img_w") or 480
+    )
+
+    preprocess = pipeline.get("preprocess")
+
+    all_probabilities = []
+    all_labels = []
+    skipped_images = []
+
+    print(
+        f"\n[RECALIBRATION] "
+        f"{pipeline['experiment_name']}"
+    )
+    print(
+        f"  Checkpoint : {checkpoint_path.name}"
+    )
+    print(
+        f"  Validation : {Path(validation_csv).name}"
+    )
+    print(
+        f"  Images attendues : {len(image_names)}"
+    )
+
+    for image_name in image_names:
+        image_path = find_existing_image(
+            image_name,
+            TRAINING_IMGS
+        )
+
+        mask_path = (
+            TRAINING_MSKS
+            / f"{image_name}_gt.png"
+        )
+
+        if (
+            image_path is None
+            or not mask_path.exists()
+        ):
+            skipped_images.append(image_name)
+            continue
+
+        pil_image = Image.open(
+            image_path
+        ).convert("RGB")
+
+        pil_for_model = apply_pipeline_preprocess(
+            pil_image,
+            preprocess,
+        )
+
+        tensor = img_to_tensor(
+            pil_for_model,
+            img_h=img_h,
+            img_w=img_w,
+        )
+
+        probability = predict_proba(
+            model,
+            tensor,
+        )
+
+        ground_truth = load_gt_mask(
+            mask_path,
+            split="training",
+            img_h=img_h,
+            img_w=img_w,
+        )
+
+        if probability.shape != ground_truth.shape:
+            probability = cv2.resize(
+                probability,
+                (
+                    ground_truth.shape[1],
+                    ground_truth.shape[0],
+                ),
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        all_probabilities.append(
+            probability.reshape(-1)
+        )
+
+        all_labels.append(
+            ground_truth.reshape(-1)
+        )
+
+    if not all_probabilities:
+        raise RuntimeError(
+            f"Aucune image valide n'a été trouvée "
+            f"pour {pipeline['experiment_name']}."
+        )
+
+    probabilities = np.concatenate(
+        all_probabilities
+    )
+
+    labels = np.concatenate(
+        all_labels
+    ).astype(np.uint8)
+
+    candidate_results = [
+        compute_calibration_metrics(
+            probabilities,
+            labels,
+            threshold,
+        )
+        for threshold in candidate_thresholds
+    ]
+
+    # Les seuils sont parcourus dans l'ordre croissant.
+    # En cas d'égalité exacte, le premier est conservé.
+    best_result = max(
+        candidate_results,
+        key=lambda result: result[
+            "calibration_score"
+        ],
+    )
+
+    best_threshold = float(
+        best_result["threshold"]
+    )
+
+    with open(
+        metadata_path,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        metadata = json.load(file)
+
+    previous_threshold = metadata.get(
+        "val_threshold"
+    )
+
+    # Conservation de l'ancienne valeur pour la traçabilité.
+    threshold_history = metadata.setdefault(
+        "threshold_history",
+        [],
+    )
+
+    threshold_history.append({
+        "val_threshold": previous_threshold,
+        "source": metadata.get(
+            "val_threshold_source",
+            "legacy_metadata",
+        ),
+        "checkpoint": metadata.get(
+            "val_threshold_checkpoint"
+        ),
+    })
+
+    metadata["val_threshold"] = (
+        best_threshold
+    )
+
+    metadata["val_threshold_source"] = (
+        "recomputed_on_fold_validation_"
+        "with_bestval_checkpoint"
+    )
+
+    metadata["val_threshold_checkpoint"] = (
+        checkpoint_path.name
+    )
+
+    metadata[
+        "val_threshold_validation_csv"
+    ] = Path(validation_csv).name
+
+    metadata["val_threshold_criterion"] = (
+        "mean_recall_specificity"
+    )
+
+    metadata[
+        "val_threshold_candidate_values"
+    ] = candidate_thresholds
+
+    metadata[
+        "val_threshold_metrics"
+    ] = best_result
+
+    metadata[
+        "val_threshold_all_candidates"
+    ] = candidate_results
+
+    metadata["val_threshold_n_images"] = (
+        len(all_probabilities)
+    )
+
+    metadata[
+        "val_threshold_n_skipped"
+    ] = len(skipped_images)
+
+    metadata[
+        "val_threshold_skipped_images"
+    ] = skipped_images
+
+    # Écriture dans un fichier temporaire,
+    # puis remplacement du JSON original.
+    temporary_path = metadata_path.with_name(
+        metadata_path.stem
+        + "_temporary.json"
+    )
+
+    with open(
+        temporary_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            metadata,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    temporary_path.replace(metadata_path)
+
+    print(
+        f"  Ancien seuil : {previous_threshold}"
+    )
+    print(
+        f"  Nouveau seuil : {best_threshold}"
+    )
+    print(
+        f"  Score : "
+        f"{best_result['calibration_score']:.6f}"
+    )
+    print(
+        f"  Images utilisées : "
+        f"{len(all_probabilities)}"
+    )
+    print(
+        f"  Images ignorées : "
+        f"{len(skipped_images)}"
+    )
+    print(
+        f"  JSON mis à jour : "
+        f"{metadata_path.name}"
+    )
+
+    return {
+        "experiment_name": (
+            pipeline["experiment_name"]
+        ),
+        "checkpoint": checkpoint_path.name,
+        "metadata": metadata_path.name,
+        "validation_csv": (
+            Path(validation_csv).name
+        ),
+        "previous_threshold": (
+            previous_threshold
+        ),
+        "new_threshold": best_threshold,
+        "n_images": len(all_probabilities),
+        "n_skipped": len(skipped_images),
+        "validation_metrics": best_result,
+    }
+
+
+@app.route(
+    "/recalibrate_vgg_bestval",
+    methods=["POST"],
+)
+def recalibrate_vgg_bestval():
+    """
+    Recalibre automatiquement les cinq folds VGG16-FCN8.
+
+    Correspondance :
+      pipeline fold 1 -> fold0_val.csv
+      pipeline fold 2 -> fold1_val.csv
+      ...
+      pipeline fold 5 -> fold4_val.csv
+    """
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    candidate_thresholds = data.get(
+        "candidate_thresholds"
+    )
+
+    if candidate_thresholds is None:
+        candidate_thresholds = [
+            0.1,
+            0.2,
+            0.3,
+            0.4,
+            0.5,
+            0.6,
+            0.7,
+            0.8,
+            0.9,
+        ]
+
+    if not VGG_FOLDS_DIR.exists():
+        return jsonify({
+            "error": (
+                "Dossier des folds introuvable : "
+                f"{VGG_FOLDS_DIR}"
+            )
+        }), 400
+
+    pipelines = discover_pipelines(
+        MODELS_DIR
+    )
+
+    vgg_pipelines = []
+
+    for pipeline in pipelines.values():
+        architecture = str(
+            pipeline.get("architecture", "")
+        ).lower()
+
+        checkpoint_path = Path(
+            pipeline["checkpoint_path"]
+        )
+
+        fold = pipeline.get("fold")
+
+        is_vgg = (
+            "vgg" in architecture
+            or "fcn" in architecture
+            or "fcn8" in checkpoint_path.name.lower()
+        )
+
+        is_bestval = (
+            checkpoint_path.stem
+            .lower()
+            .endswith("_bestval")
+        )
+
+        if (
+            is_vgg
+            and is_bestval
+            and fold is not None
+        ):
+            vgg_pipelines.append(pipeline)
+
+    vgg_pipelines = sorted(
+        vgg_pipelines,
+        key=lambda pipeline: int(
+            pipeline["fold"]
+        ),
+    )
+
+    if not vgg_pipelines:
+        return jsonify({
+            "error": (
+                "Aucun pipeline VGG16-FCN8 bestval "
+                "n'a été détecté."
+            )
+        }), 400
+
+    results = []
+    errors = []
+
+    for pipeline in vgg_pipelines:
+        fold_label = int(
+            pipeline["fold"]
+        )
+
+        # Fold affiché 1 -> fichier fold0_val.csv
+        csv_index = fold_label - 1
+
+        validation_csv = (
+            VGG_FOLDS_DIR
+            / f"fold{csv_index}_val.csv"
+        )
+
+        try:
+            result = (
+                recalibrate_one_bestval_pipeline(
+                    pipeline=pipeline,
+                    validation_csv=validation_csv,
+                    candidate_thresholds=(
+                        candidate_thresholds
+                    ),
+                )
+            )
+
+            results.append(result)
+
+        except Exception as exc:
+            errors.append({
+                "experiment_name": (
+                    pipeline.get(
+                        "experiment_name"
+                    )
+                ),
+                "fold": fold_label,
+                "validation_csv": (
+                    validation_csv.name
+                ),
+                "error": str(exc),
+            })
+
+    return jsonify({
+        "message": (
+            "Recalibration terminée. "
+            "Redémarre l'application avant "
+            "de relancer les évaluations."
+        ),
+        "folds_directory": str(
+            VGG_FOLDS_DIR
+        ),
+        "candidate_thresholds": (
+            candidate_thresholds
+        ),
+        "results": results,
+        "errors": errors,
+    })
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/models', methods=['GET'])
 def get_models():
-    return jsonify({'models': list(MODELS.keys())})
+    return jsonify({
+        'models': list(MODELS_CONFIG.keys())
+    })
 
 
 # On pourra afficher deux choix pour l'utilisateur :
@@ -1471,33 +2538,52 @@ def get_models():
 @app.route('/config', methods=['GET'])
 def get_config():
     """
-    Retourne les modèles disponibles, le seuil fixe et les seuils calibrés.
+    Retourne les modèles disponibles, le seuil fixe
+    et les seuils calibrés.
+
+    MODELS_CONFIG contient les checkpoints disponibles.
+    MODELS contient uniquement les modèles déjà chargés en mémoire.
     """
+
+    available_models = list(MODELS_CONFIG.keys())
+
     fixed_thresholds = {
         name: DECISION_THRESHOLD
-        for name in MODELS.keys()
+        for name in available_models
     }
 
     calibrated_thresholds = {
-        name: MODEL_THRESHOLDS.get(name, DECISION_THRESHOLD)
-        for name in MODELS.keys()
+        name: MODEL_THRESHOLDS.get(
+            name,
+            DECISION_THRESHOLD
+        )
+        for name in available_models
     }
 
     return jsonify({
-        'models': list(MODELS.keys()),
+        'models': available_models,
 
         'decision_threshold': DECISION_THRESHOLD,
 
         'fixed_thresholds': fixed_thresholds,
         'calibrated_thresholds': calibrated_thresholds,
 
-        'threshold_modes': ['fixed', 'calibrated'],
-        'uncertainty_modes': ['standard', 'threshold'],
+        'threshold_modes': [
+            'fixed',
+            'calibrated'
+        ],
 
-        'threshold_mode_default': THRESHOLD_MODE_DEFAULT,
-        'uncertainty_mode_default': UNCERTAINTY_MODE_DEFAULT,
+        'uncertainty_modes': [
+            'standard',
+            'threshold'
+        ],
+
+        'threshold_mode_default':
+            THRESHOLD_MODE_DEFAULT,
+
+        'uncertainty_mode_default':
+            UNCERTAINTY_MODE_DEFAULT,
     })
-
 
 def get_model_decision_threshold(model_name, threshold_mode="fixed"):
     """
@@ -1626,13 +2712,36 @@ def predict():
             if m.strip()
         ]
 
-    active_models = {
-        k: v for k, v in MODELS.items()
-        if not selected_models or k in selected_models
-    }
+    # ==========================================================
+    # Chargement uniquement des modèles sélectionnés
+    # ==========================================================
+
+    if not selected_models:
+        selected_models = list(
+            MODELS_CONFIG.keys()
+        )
+
+    active_models = {}
+
+    for name in selected_models:
+
+        if name not in MODELS_CONFIG:
+            continue
+
+        checkpoint_path = MODELS_CONFIG[name]
+
+        model = get_or_load_model(
+            name,
+            checkpoint_path
+        )
+
+        active_models[name] = model
+
 
     if not active_models:
-        return jsonify({'error': 'Aucun modèle sélectionné'}), 400
+        return jsonify({
+            'error': 'Aucun modèle sélectionné ou disponible'
+        }), 400
 
     # ==========================================================
     # 1. Lecture de l'image
@@ -1646,11 +2755,8 @@ def predict():
         None if inference_preprocess == "none" else inference_preprocess
     )
 
-    tensor = img_to_tensor(pil_for_inference)
-
-    # Image originale affichée
-    img_rgb = np.array(
-        pil_orig.convert('RGB').resize((IMG_W, IMG_H), Image.BILINEAR)
+    img_rgb_original = np.array(
+    pil_orig.convert("RGB")
     )
 
     # Image prétraitée affichable
@@ -1664,28 +2770,34 @@ def predict():
     # ==========================================================
     # 2. Recherche du masque GT si l'image appartient au dataset
     # ==========================================================
-    gt_mask = None
-    gt_native_b64 = None
+    gt_path_found = None
     gt_source = None
 
     for split_name, img_dir, mask_dir in [
         ('testing', TESTING_IMGS, TESTING_MSKS),
         ('training', TRAINING_IMGS, TRAINING_MSKS),
     ]:
-        gt_path = mask_dir / (base + '_gt.png')
+        gt_path = mask_dir / (
+            base + '_gt.png'
+        )
 
         if gt_path.exists():
-            gt_mask = load_gt_mask(gt_path, split_name)
-            gt_native_rgb = load_gt_mask_native_colors(gt_path, split_name)
-            gt_native_b64 = arr_to_b64(gt_native_rgb)
+            gt_path_found = gt_path
             gt_source = split_name
             break
 
-    orig_b64 = arr_to_b64(img_rgb)
+    orig_b64 = arr_to_b64(img_rgb_original)
     preprocessed_b64 = arr_to_b64(preprocessed_rgb)
 
     # Si l'image n'est pas dans le dataset, on utilise testing par défaut
     split_for_colors = gt_source if gt_source else 'testing'
+
+    # ==========================================================
+    # 3. Prédiction des modèles individuels
+    # ==========================================================
+    # Résolution commune utilisée uniquement pour la fusion d'ensemble
+    ensemble_img_h = IMG_H   # 352
+    ensemble_img_w = IMG_W   # 480
 
     results = []
 
@@ -1693,224 +2805,649 @@ def predict():
     # pour construire ensuite le modèle d'ensemble.
     proba_list = []
     pred_list = []
+
     model_thresholds_used = {}
 
+    # GT uniquement destiné à l'ensemble
+    gt_mask_ensemble = None
+
+    if gt_path_found is not None:
+        gt_mask_ensemble = load_gt_mask(
+            gt_path_found,
+            gt_source,
+            img_h=ensemble_img_h,
+            img_w=ensemble_img_w
+        )
+
     # ==========================================================
-    # 3. Prédiction des modèles individuels
+    # GT général conservé pour compatibilité avec le frontend
     # ==========================================================
+
+    gt_general_b64 = None
+
+    if gt_path_found is not None:
+
+        gt_general_rgb = (
+            load_gt_mask_native_colors(
+                gt_path_found,
+                gt_source,
+                img_h=pil_orig.height,
+                img_w=pil_orig.width
+            )
+        )
+
+        gt_general_b64 = arr_to_b64(
+            gt_general_rgb
+        )
+
     for name, model in active_models.items():
 
-        # Carte de probabilité p(posidonie)
-        proba = predict_proba(model, tensor)
+        # ======================================================
+        # 1. Checkpoint associé
+        # ======================================================
 
-        # Seuil du modèle :
-        # - fixed      : 0.5
-        # - calibrated : seuil calibré sur validation
-        model_threshold = get_model_decision_threshold(name, threshold_mode)
-        model_thresholds_used[name] = model_threshold
+        checkpoint_path = MODELS_CONFIG[
+            name
+        ]
 
-        # Segmentation finale du modèle
-        pred = (proba >= model_threshold).astype(np.uint8)
+        # ======================================================
+        # 2. Résolution réellement utilisée par le pipeline
+        # ======================================================
 
-        # Carte de probabilité visualisable : sortie continue avant seuillage
-        probability_heatmap = make_probability_heatmap(proba, colormap="gray")
-
-        # Stockage pour l'ensemble
-        proba_list.append(proba)
-        pred_list.append(pred)
-
-        # Segmentation avec couleurs natives
-        class_overlay = make_native_class_overlay(pred, split_for_colors)
-
-        # Erreurs FP/FN si le masque GT existe.
-        # On ne mélange plus les erreurs avec les zones d'incertitude.
-        if gt_mask is not None:
-            error_overlay = make_error_zones_overlay_without_uncertainty(
-                pred,
-                gt_mask
+        model_img_h, model_img_w = (
+            get_model_input_size(
+                name,
+                checkpoint_path
             )
+        )
+
+        print(
+            f"[PREDICT] {name} | "
+            f"entrée={model_img_h}x{model_img_w}"
+        )
+
+        # ======================================================
+        # 3. Prétraitement demandé depuis l'interface
+        # ======================================================
+
+        pil_for_model = (
+            apply_pipeline_preprocess(
+                pil_orig,
+                None
+                if inference_preprocess == "none"
+                else inference_preprocess
+            )
+        )
+
+        # ======================================================
+        # 4. Image réellement utilisée par le modèle
+        # ======================================================
+
+        model_input_pil = (
+            pil_for_model
+            .convert("RGB")
+            .resize(
+                (
+                    model_img_w,
+                    model_img_h
+                ),
+                Image.BILINEAR
+            )
+        )
+
+        model_input_rgb = np.array(
+            model_input_pil
+        )
+
+        tensor_model = (
+            transforms
+            .ToTensor()(
+                model_input_pil
+            )
+            .unsqueeze(0)
+        )
+
+        # ======================================================
+        # 5. Prédiction native
+        # ======================================================
+
+        proba = predict_proba(
+            model,
+            tensor_model
+        )
+
+        model_threshold = (
+            get_model_decision_threshold(
+                name,
+                threshold_mode
+            )
+        )
+
+        model_thresholds_used[
+            name
+        ] = model_threshold
+
+        pred = (
+            proba >= model_threshold
+        ).astype(np.uint8)
+
+        # ======================================================
+        # 6. Ground truth à la résolution propre du modèle
+        # ======================================================
+
+        gt_mask_model = None
+        gt_native_model_b64 = None
+
+        if gt_path_found is not None:
+
+            gt_mask_model = load_gt_mask(
+                gt_path_found,
+                gt_source,
+                img_h=model_img_h,
+                img_w=model_img_w
+            )
+
+            gt_native_model = (
+                load_gt_mask_native_colors(
+                    gt_path_found,
+                    gt_source,
+                    img_h=model_img_h,
+                    img_w=model_img_w
+                )
+            )
+
+            gt_native_model_b64 = (
+                arr_to_b64(
+                    gt_native_model
+                )
+            )
+
+        # Les métriques sont calculées à la résolution réelle du modèle
+        metrics = (
+            compute_metrics(
+                pred,
+                gt_mask_model
+            )
+            if gt_mask_model is not None
+            else None
+        )
+
+        # ======================================================
+        # 7. Visualisations individuelles
+        #    Elles restent à la résolution réelle du pipeline
+        # ======================================================
+
+        probability_heatmap = (
+            make_probability_heatmap(
+                proba,
+                colormap="gray"
+            )
+        )
+
+        class_overlay = (
+            make_native_class_overlay(
+                pred,
+                split_for_colors
+            )
+        )
+
+        if gt_mask_model is not None:
+
+            error_overlay = (
+                make_error_zones_overlay_without_uncertainty(
+                    pred,
+                    gt_mask_model
+                )
+            )
+
         else:
             error_overlay = None
 
-        metrics = compute_metrics(pred, gt_mask) if gt_mask is not None else None
+        # ======================================================
+        # 8. Incertitude individuelle
+        # ======================================================
 
-        # ======================================================
-        # Incertitude du modèle individuel
-        # ======================================================
-        single_uncertainty = compute_uncertainty_by_mode(
-            [proba],
-            uncertainty_mode=uncertainty_mode,
-            threshold=model_threshold
+        single_uncertainty = (
+            compute_uncertainty_by_mode(
+                [proba],
+                uncertainty_mode=uncertainty_mode,
+                threshold=model_threshold
+            )
         )
 
-        uncertainty_heatmap = make_uncertainty_heatmap(
-            single_uncertainty["dirichlet_uncertainty_norm"]
+        uncertainty_heatmap = (
+            make_uncertainty_heatmap(
+                single_uncertainty[
+                    "dirichlet_uncertainty_norm"
+                ]
+            )
         )
 
-        uncertainty_stats = single_uncertainty["stats"]
+        uncertainty_stats = (
+            single_uncertainty["stats"]
+        )
 
-        posidonia_cover = float(np.mean(pred) * 100.0)
+        posidonia_cover = float(
+            np.mean(pred) * 100.0
+        )
+
+        # ======================================================
+        # 9. Résultat individuel envoyé au navigateur
+        # ======================================================
 
         results.append({
-            'name': name,
+            "name": name,
 
-            'class_overlay': arr_to_b64(class_overlay),
-            'probability_map': arr_to_b64(probability_heatmap),
-            'error_overlay': arr_to_b64(error_overlay) if error_overlay is not None else None,
-            'uncertainty_overlay': arr_to_b64(uncertainty_heatmap),
+            "input_image": arr_to_b64(
+                model_input_rgb
+            ),
 
-            'metrics': metrics,
+            "ground_truth": (
+                gt_native_model_b64
+            ),
 
-            'threshold_used': model_threshold,
-            'threshold_mode': threshold_mode,
-            'posidonia_cover_percent': posidonia_cover,
+            "class_overlay": arr_to_b64(
+                class_overlay
+            ),
 
-            'uncertainty': {
-                'type': 'single_model_dirichlet',
-                'mode': uncertainty_mode,
-                'description': (
-                    'Incertitude Dirichlet standard centrée sur 0.5.'
-                    if uncertainty_mode == "standard"
-                    else 'Incertitude Dirichlet adaptée au seuil de décision du modèle.'
+            "probability_map": arr_to_b64(
+                probability_heatmap
+            ),
+
+            "error_overlay": (
+                arr_to_b64(error_overlay)
+                if error_overlay is not None
+                else None
+            ),
+
+            "uncertainty_overlay": arr_to_b64(
+                uncertainty_heatmap
+            ),
+
+            # Dimensions réellement utilisées
+            "input_height": model_img_h,
+            "input_width": model_img_w,
+
+            "resolution": (
+                f"{model_img_h}x{model_img_w}"
+            ),
+
+            "resolution_type": "pipeline",
+
+            "metrics": metrics,
+
+            "threshold_used": (
+                model_threshold
+            ),
+
+            "threshold_mode": (
+                threshold_mode
+            ),
+
+            "posidonia_cover_percent": (
+                posidonia_cover
+            ),
+
+            "uncertainty": {
+                "type": (
+                    "single_model_dirichlet"
                 ),
+
+                "mode": (
+                    uncertainty_mode
+                ),
+
+                "description": (
+                    "Incertitude Dirichlet standard centrée sur 0.5."
+                    if uncertainty_mode == "standard"
+                    else
+                    "Incertitude Dirichlet adaptée au seuil de décision du modèle."
+                ),
+
                 **uncertainty_stats
             }
         })
 
+        # ======================================================
+        # 10. Copie UNIQUEMENT destinée à l'ensemble
+        # ======================================================
+
+        if proba.shape != (
+            ensemble_img_h,
+            ensemble_img_w
+        ):
+
+            proba_for_ensemble = cv2.resize(
+                proba,
+                (
+                    ensemble_img_w,
+                    ensemble_img_h
+                ),
+                interpolation=cv2.INTER_LINEAR
+            )
+
+        else:
+            proba_for_ensemble = proba
+
+        # Le seuil reste celui du modèle individuel
+        pred_for_ensemble = (
+            proba_for_ensemble
+            >= model_threshold
+        ).astype(np.uint8)
+
+        proba_list.append(
+            proba_for_ensemble
+        )
+
+        pred_list.append(
+            pred_for_ensemble
+        )
+
     # ==========================================================
     # 4. Prédiction du modèle ensemble
     # ==========================================================
+
     n_models = len(proba_list)
 
     threshold_list = [
-        get_model_decision_threshold(name, threshold_mode)
+        get_model_decision_threshold(
+            name,
+            threshold_mode
+        )
         for name in active_models.keys()
     ]
 
     if threshold_mode == "calibrated":
-        ensemble_threshold = float(np.mean(threshold_list))
+        ensemble_threshold = float(
+            np.mean(threshold_list)
+        )
     else:
-        ensemble_threshold = DECISION_THRESHOLD
+        ensemble_threshold = (
+            DECISION_THRESHOLD
+        )
 
-    if ensemble_method == 'soft':
-        # Soft voting :
-        # moyenne des probabilités puis seuillage.
-        # En fixed      : seuil 0.5
-        # En calibrated : seuil moyen des modèles calibrés
-        proba_final = np.mean(proba_list, axis=0)
-        pred_final = (proba_final >= ensemble_threshold).astype(np.uint8)
 
-        ensemble_label = 'Ensemble (soft voting)'
+    # ==========================================================
+    # 4.1 Soft voting ou hard voting
+    # ==========================================================
 
-        threshold_used_for_display = ensemble_threshold
+    if ensemble_method == "soft":
+
+        # Toutes les cartes contenues dans proba_list
+        # sont déjà à la résolution commune 352×480.
+        proba_final = np.mean(
+            proba_list,
+            axis=0
+        )
+
+        pred_final = (
+            proba_final
+            >= ensemble_threshold
+        ).astype(np.uint8)
+
+        ensemble_label = (
+            "Ensemble (soft voting)"
+        )
+
+        threshold_used_for_display = (
+            ensemble_threshold
+        )
+
 
     else:
-        # Hard voting :
-        # chaque modèle produit déjà sa segmentation avec son propre seuil,
-        # puis on applique le vote majoritaire.
-        vote_sum = np.stack(pred_list, axis=0).sum(axis=0)
 
-        # Majorité stricte : en cas d'égalité, on garde fond = 0
-        pred_final = (vote_sum > n_models / 2).astype(np.uint8)
+        # Chaque prédiction contenue dans pred_list
+        # est déjà à la résolution commune 352×480.
+        vote_sum = (
+            np.stack(
+                pred_list,
+                axis=0
+            )
+            .sum(axis=0)
+        )
 
-        # Ici proba_final représente le taux de votes pour la posidonie.
-        # Exemple : 3 modèles sur 4 votent posidonie => proba_final = 0.75
-        proba_final = vote_sum / n_models
+        # Majorité stricte.
+        # En cas d'égalité, le fond est conservé.
+        pred_final = (
+            vote_sum > n_models / 2
+        ).astype(np.uint8)
 
-        ensemble_label = 'Ensemble (hard voting / majority voting)'
+        # Pour le hard voting, cette carte correspond
+        # à la proportion de modèles votant Posidonie.
+        proba_final = (
+            vote_sum / n_models
+        )
+
+        ensemble_label = (
+            "Ensemble "
+            "(hard voting / majority voting)"
+        )
 
         if threshold_mode == "calibrated":
-            threshold_used_for_display = 'individual_calibrated_thresholds'
+            threshold_used_for_display = (
+                "individual_calibrated_thresholds"
+            )
         else:
-            threshold_used_for_display = DECISION_THRESHOLD
-
+            threshold_used_for_display = (
+                DECISION_THRESHOLD
+            )
     # Carte de probabilité de l'ensemble : proba moyenne ou taux de vote posidonie
-    ensemble_probability_heatmap = make_probability_heatmap(proba_final, colormap="gray")
+    ensemble_probability_heatmap = (
+        make_probability_heatmap(
+            proba_final,
+            colormap="gray"
+        )
+    )
 
     # ==========================================================
     # 5. Désaccord entre modèles
     # ==========================================================
-    votes = np.stack(pred_list, axis=0)
 
-    votes_posidonie = np.sum(votes == 1, axis=0)
-    votes_fond = np.sum(votes == 0, axis=0)
+    votes = np.stack(
+        pred_list,
+        axis=0
+    )
 
-    majority_votes = np.maximum(votes_posidonie, votes_fond)
+    votes_posidonie = np.sum(
+        votes == 1,
+        axis=0
+    )
 
-    agreement_map = majority_votes / n_models
-    disagreement_map = 1.0 - agreement_map
-    disagreement_pixels = disagreement_map > 0.0
+    votes_fond = np.sum(
+        votes == 0,
+        axis=0
+    )
 
-    agreement_percent = float(np.mean(agreement_map) * 100.0)
-    disagreement_percent = float(np.mean(disagreement_map) * 100.0)
-    disagreement_pixel_percent = float(np.mean(disagreement_pixels) * 100.0)
+    majority_votes = np.maximum(
+        votes_posidonie,
+        votes_fond
+    )
+
+    agreement_map = (
+        majority_votes / n_models
+    )
+
+    disagreement_map = (
+        1.0 - agreement_map
+    )
+
+    disagreement_pixels = (
+        disagreement_map > 0.0
+    )
+
+    agreement_percent = float(
+        np.mean(agreement_map)
+        * 100.0
+    )
+
+    disagreement_percent = float(
+        np.mean(disagreement_map)
+        * 100.0
+    )
+
+    disagreement_pixel_percent = float(
+        np.mean(disagreement_pixels)
+        * 100.0
+    )
 
     # ==========================================================
     # 6. Incertitude Dirichlet de l'ensemble
     # ==========================================================
-    # standard  : Dirichlet centrée sur 0.5
-    # threshold : Dirichlet adaptée au seuil de décision
-    #
-    # Pour l'ensemble, si on est en mode calibrated, on utilise le seuil moyen
-    # comme seuil opérationnel de l'ensemble.
-    ensemble_uncertainty_threshold = ensemble_threshold
 
-    ensemble_dirichlet = compute_uncertainty_by_mode(
-        proba_list,
-        uncertainty_mode=uncertainty_mode,
-        threshold=ensemble_uncertainty_threshold
+    ensemble_uncertainty_threshold = (
+        ensemble_threshold
     )
 
-    ensemble_uncertainty_heatmap = make_uncertainty_heatmap(
-        ensemble_dirichlet["dirichlet_uncertainty_norm"]
+    ensemble_dirichlet = (
+        compute_uncertainty_by_mode(
+            proba_list,
+            uncertainty_mode=uncertainty_mode,
+            threshold=
+                ensemble_uncertainty_threshold
+        )
+    )
+
+    ensemble_uncertainty_heatmap = (
+        make_uncertainty_heatmap(
+            ensemble_dirichlet[
+                "dirichlet_uncertainty_norm"
+            ]
+        )
     )
 
     # ==========================================================
     # 7. Visualisations et métriques de l'ensemble
     # ==========================================================
-    ens_class_overlay = make_native_class_overlay(pred_final, split_for_colors)
 
-    if gt_mask is not None:
-        ens_error_overlay = make_error_zones_overlay_without_uncertainty(
+    ens_class_overlay = (
+        make_native_class_overlay(
             pred_final,
-            gt_mask
+            split_for_colors
         )
+    )
+
+
+    if gt_mask_ensemble is not None:
+
+        ens_error_overlay = (
+            make_error_zones_overlay_without_uncertainty(
+                pred_final,
+                gt_mask_ensemble
+            )
+        )
+
     else:
         ens_error_overlay = None
 
-    ens_metrics = compute_metrics(pred_final, gt_mask) if gt_mask is not None else None
 
-    ens_posidonia_cover = float(np.mean(pred_final) * 100.0)
+    ens_metrics = (
+        compute_metrics(
+            pred_final,
+            gt_mask_ensemble
+        )
+        if gt_mask_ensemble is not None
+        else None
+    )
 
-    results.append({
-        'name': ensemble_label,
 
-        'class_overlay': arr_to_b64(ens_class_overlay),
-        'probability_map': arr_to_b64(ensemble_probability_heatmap),
-        'error_overlay': arr_to_b64(ens_error_overlay) if ens_error_overlay is not None else None,
-        'uncertainty_overlay': arr_to_b64(ensemble_uncertainty_heatmap),
+    ens_posidonia_cover = float(
+        np.mean(pred_final)
+        * 100.0
+    )
 
-        'metrics': ens_metrics,
+    gt_ensemble_b64 = None
 
-        'threshold_used': threshold_used_for_display,
-        'threshold_mode': threshold_mode,
-        'posidonia_cover_percent': ens_posidonia_cover,
+    if gt_path_found is not None:
 
-        'uncertainty': {
-            'type': 'ensemble_dirichlet',
-            'mode': uncertainty_mode,
-            'description': (
-                'Incertitude Dirichlet standard calculée à partir des probabilités des modèles.'
+        gt_ensemble_rgb = (
+            load_gt_mask_native_colors(
+                gt_path_found,
+                gt_source,
+                img_h=ensemble_img_h,
+                img_w=ensemble_img_w
+            )
+        )
+
+        gt_ensemble_b64 = arr_to_b64(
+            gt_ensemble_rgb
+        )
+
+        results.append({
+        "name": ensemble_label,
+
+        "ground_truth": (
+            gt_ensemble_b64
+        ),
+
+        "class_overlay": arr_to_b64(
+            ens_class_overlay
+        ),
+
+        "probability_map": arr_to_b64(
+            ensemble_probability_heatmap
+        ),
+
+        "error_overlay": (
+            arr_to_b64(
+                ens_error_overlay
+            )
+            if ens_error_overlay is not None
+            else None
+        ),
+
+        "uncertainty_overlay": arr_to_b64(
+            ensemble_uncertainty_heatmap
+        ),
+
+        # Résolution de fusion
+        "input_height": ensemble_img_h,
+        "input_width": ensemble_img_w,
+
+        "resolution": (
+            f"{ensemble_img_h}x{ensemble_img_w}"
+        ),
+
+        "resolution_type": "fusion",
+
+        "metrics": ens_metrics,
+
+        "threshold_used":
+            threshold_used_for_display,
+
+        "threshold_mode":
+            threshold_mode,
+
+        "posidonia_cover_percent":
+            ens_posidonia_cover,
+
+        "uncertainty": {
+            "type":
+                "ensemble_dirichlet",
+
+            "mode":
+                uncertainty_mode,
+
+            "description": (
+                "Incertitude Dirichlet standard calculée "
+                "à partir des probabilités des modèles."
                 if uncertainty_mode == "standard"
-                else 'Incertitude Dirichlet adaptée au seuil de décision de l’ensemble.'
+                else
+                "Incertitude Dirichlet adaptée au seuil "
+                "de décision de l'ensemble."
             ),
-            'agreement_percent': agreement_percent,
-            'disagreement_percent': disagreement_percent,
-            'uncertain_pixel_percent': disagreement_pixel_percent,
+
+            "agreement_percent":
+                agreement_percent,
+
+            "disagreement_percent":
+                disagreement_percent,
+
+            "uncertain_pixel_percent":
+                disagreement_pixel_percent,
+
             **ensemble_dirichlet["stats"]
         }
     })
-
     # ==========================================================
     # 8. Réponse JSON
     # ==========================================================
@@ -1923,16 +3460,17 @@ def predict():
             else "Expansion RGB + égalisation" if inference_preprocess == "expansion_rgb"
             else "Aucun prétraitement"
         ),
-        'gt': gt_native_b64,
         'gt_source': gt_source,
 
         'results': results,
-        'has_gt': gt_native_b64 is not None,
 
         'ensemble_method': ensemble_method,
 
         'threshold_mode': threshold_mode,
         'uncertainty_mode': uncertainty_mode,
+        'gt': gt_general_b64,
+        'has_gt': gt_general_b64 is not None,
+        'gt_source': gt_source,
 
         'decision_threshold': DECISION_THRESHOLD,
         'ensemble_threshold': ensemble_threshold,
@@ -1946,9 +3484,24 @@ def evaluate_page():
     pipelines = discover_pipelines(MODELS_DIR)
     return render_template('evaluate.html', pipelines=pipelines)
 
-# ── Route d'évaluation ──
 @app.route('/run_evaluate', methods=['POST'])
 def run_evaluate():
+
+    try:
+        return _run_evaluate_impl()
+
+    except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+
+        return jsonify({
+            "error": str(exc),
+            "type": type(exc).__name__,
+        }), 500
+
+
+def _run_evaluate_impl():
     data = request.get_json() or {}
 
     split = data.get('split', 'both')       # 'val', 'test', ou 'both'
@@ -2013,13 +3566,31 @@ def run_evaluate():
             active_pipelines[label] = pipeline
 
     else:
-        active_models = {
-            k: v for k, v in MODELS.items()
-            if not selected_models or k in selected_models
-        }
+        if not selected_models:
+            selected_models = list(
+                MODELS_CONFIG.keys()
+            )
+
+        active_models = {}
+
+        for name in selected_models:
+
+            if name not in MODELS_CONFIG:
+                continue
+
+            checkpoint_path = MODELS_CONFIG[name]
+
+            model = get_or_load_model(
+                name,
+                checkpoint_path
+            )
+
+            active_models[name] = model
 
         if not active_models:
-            return jsonify({'error': 'Aucun modèle sélectionné'}), 400
+            return jsonify({
+                "error": "Aucun modèle sélectionné ou disponible"
+            }), 400
 
     # ----------------------------------------------------------
     # Liste des images selon le split
@@ -2264,9 +3835,28 @@ def run_evaluate():
             return None
 
         ensemble_is_active = (not pipeline_mode) or ensemble_pipeline_mode
+        # Résolution commune utilisée uniquement pour l'ensemble
+        ensemble_img_h = IMG_H   # 352
+        ensemble_img_w = IMG_W   # 480
 
-        all_probas = {name: [] for name in active_models}
-        all_preds = {name: [] for name in active_models}
+        all_probas = {
+            name: []
+            for name in active_models
+        }
+
+        all_preds = {
+            name: []
+            for name in active_models
+        }
+
+        # Chaque modèle garde ses propres GT à sa résolution native
+        all_labels_by_model = {
+            name: []
+            for name in active_models
+        }
+
+        # GT distinct pour l'ensemble à la résolution de fusion
+        all_labels_ensemble = []
 
 # pour calculer le temps d'inférence 
         all_inference_times = {name: [] for name in active_models}
@@ -2276,7 +3866,6 @@ def run_evaluate():
             all_probas['__ensemble__'] = []
             all_preds['__ensemble__'] = []
 
-        all_labels = []
 
         all_single_dirichlet_uncertainties = {name: [] for name in active_models}
         all_single_dirichlet_uncertain_pixels = {name: [] for name in active_models}
@@ -2322,36 +3911,56 @@ def run_evaluate():
 
             pil_img = Image.open(img_path).convert("RGB")
 
-            if pipeline_mode:
-                reference_pipeline = selected_pipelines[0]
-                eval_img_h = reference_pipeline.get("img_h") or IMG_H
-                eval_img_w = reference_pipeline.get("img_w") or IMG_W
-            else:
-                eval_img_h = IMG_H
-                eval_img_w = IMG_W
-
-            gt_mask = load_gt_mask(
-                mask_path,
-                mask_format,
-                img_h=eval_img_h,
-                img_w=eval_img_w
-            )
 
             proba_list = []
             pred_list = []
 
+            # Masque destiné uniquement à l'ensemble
+            gt_mask_ensemble = None
+
+            if ensemble_is_active:
+                gt_mask_ensemble = load_gt_mask(
+                    mask_path,
+                    mask_format,
+                    img_h=ensemble_img_h,
+                    img_w=ensemble_img_w
+                )
             for name, model in active_models.items():
                 if pipeline_mode:
                     pipeline = active_pipelines[name]
-                    preprocess = pipeline.get("preprocess")
-                    img_h = pipeline.get("img_h") or IMG_H
-                    img_w = pipeline.get("img_w") or IMG_W
 
-                    pil_for_model = apply_pipeline_preprocess(pil_img, preprocess)
-                    tensor_model = img_to_tensor(pil_for_model, img_h=img_h, img_w=img_w)
+                    preprocess = pipeline.get("preprocess")
+                    img_h = int(pipeline.get("img_h") or IMG_H)
+                    img_w = int(pipeline.get("img_w") or IMG_W)
+
+                    pil_for_model = apply_pipeline_preprocess(
+                        pil_img,
+                        preprocess
+                    )
+
+                    tensor_model = img_to_tensor(
+                        pil_for_model,
+                        img_h=img_h,
+                        img_w=img_w
+                    )
 
                 else:
-                    tensor_model = img_to_tensor(pil_img)
+                    img_h = IMG_H
+                    img_w = IMG_W
+
+                    tensor_model = img_to_tensor(
+                        pil_img,
+                        img_h=img_h,
+                        img_w=img_w
+                    )
+
+                # GT propre au modèle, à sa résolution native
+                gt_mask_model = load_gt_mask(
+                    mask_path,
+                    mask_format,
+                    img_h=img_h,
+                    img_w=img_w
+                )
 
                 synchronize_if_cuda()
                 start_time = time.perf_counter()
@@ -2366,11 +3975,13 @@ def run_evaluate():
                 inference_time = end_time - start_time
                 all_inference_times[name].append(inference_time)
 
-                # Remettre toutes les probabilités à la résolution de référence
-                if proba.shape != gt_mask.shape:
+                if proba.shape != gt_mask_model.shape:
                     proba = cv2.resize(
                         proba,
-                        (gt_mask.shape[1], gt_mask.shape[0]),
+                        (
+                            gt_mask_model.shape[1],
+                            gt_mask_model.shape[0]
+                        ),
                         interpolation=cv2.INTER_LINEAR
                     )
 
@@ -2380,8 +3991,34 @@ def run_evaluate():
                 all_probas[name].append(proba.flatten())
                 all_preds[name].append(pred.flatten())
 
-                proba_list.append(proba)
-                pred_list.append(pred)
+                all_labels_by_model[name].append(
+                    gt_mask_model.flatten()
+                )
+
+                # Pour l'ensemble, toutes les cartes sont ramenées
+                # explicitement à 352 × 480
+                if ensemble_is_active:
+                    if proba.shape != (
+                        ensemble_img_h,
+                        ensemble_img_w
+                    ):
+                        proba_for_ensemble = cv2.resize(
+                            proba,
+                            (
+                                ensemble_img_w,
+                                ensemble_img_h
+                            ),
+                            interpolation=cv2.INTER_LINEAR
+                        )
+                    else:
+                        proba_for_ensemble = proba
+
+                    pred_for_ensemble = (
+                        proba_for_ensemble >= model_threshold
+                    ).astype(np.uint8)
+
+                    proba_list.append(proba_for_ensemble)
+                    pred_list.append(pred_for_ensemble)
 
                 single_dirichlet = compute_uncertainty_by_mode(
                     [proba],
@@ -2456,13 +4093,29 @@ def run_evaluate():
                     ensemble_dirichlet["uncertain_pixels_dirichlet"].flatten()
                 )
 
-            all_labels.append(gt_mask.flatten())
+            if ensemble_is_active:
+                all_labels_ensemble.append(
+                    gt_mask_ensemble.flatten()
+                )
+
             n_images += 1
 
         if n_images == 0:
             return None
 
-        all_labels_np = np.concatenate(all_labels)
+        labels_by_model_np = {
+            name: np.concatenate(
+                all_labels_by_model[name]
+            )
+            for name in active_models
+        }
+
+        if ensemble_is_active:
+            labels_ensemble_np = np.concatenate(
+                all_labels_ensemble
+            )
+        else:
+            labels_ensemble_np = None
 
         def summarize_single_uncertainty(model_name):
             dirichlet_u = np.concatenate(
@@ -2519,7 +4172,7 @@ def run_evaluate():
 
                 results[label] = compute_full_metrics(
                     all_probas[name],
-                    all_labels_np,
+                    labels_ensemble_np,
                     ensemble_threshold,
                     preds_list=all_preds[name]
                 )
@@ -2547,7 +4200,7 @@ def run_evaluate():
 
                 results[label] = compute_full_metrics(
                     all_probas[name],
-                    all_labels_np,
+                    labels_by_model_np[name],
                     model_threshold,
                     preds_list=all_preds[name]
                 )
@@ -2622,7 +4275,8 @@ def run_evaluate():
             'Val + Test',
             method,
             ensemble_threshold_used,
-            model_thresholds=model_thresholds_used
+            model_thresholds=model_thresholds_used,
+            active_pipelines=active_pipelines if pipeline_mode else None
         )
 
         n_images_info = (
@@ -2636,7 +4290,8 @@ def run_evaluate():
             'Validation',
             method,
             ensemble_threshold_used,
-            model_thresholds=model_thresholds_used
+            model_thresholds=model_thresholds_used,
+            active_pipelines=active_pipelines if pipeline_mode else None
         )
 
         n_images_info = f"Val: {results_val['n_images']}"
@@ -2647,7 +4302,8 @@ def run_evaluate():
             'Test',
             method,
             ensemble_threshold_used,
-            model_thresholds=model_thresholds_used
+            model_thresholds=model_thresholds_used,
+            active_pipelines=active_pipelines if pipeline_mode else None
         )
 
         n_images_info = f"Test: {results_test['n_images']}"
