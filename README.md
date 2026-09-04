@@ -277,8 +277,3 @@ python -c "import torch, transformers, torchvision, numpy, cv2, matplotlib, flas
 - scikit-learn
 - Flask
 
-## Contexte
-
-Ce projet a été réalisé dans le cadre d'un stage de Master 2 Informatique – parcours Exploration Informatique des Données et Décisionnel, en collaboration avec le GREAH – Université Le Havre Normandie.
-
-Le travail s'inscrit dans le projet OCTOPUS, consacré notamment à l'utilisation de la robotique mobile et de l'intelligence artificielle pour la surveillance des environnements maritimes et côtiers.
