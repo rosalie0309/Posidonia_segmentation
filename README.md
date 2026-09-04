@@ -1,8 +1,8 @@
-# Project OCTOPUS – Posidonia oceanica Semantic Segmentation
+# Project de Stage -- Posidonia oceanica Semantic Segmentation
 
 Projet de segmentation sémantique d'images sous-marines pour la détection de *Posidonia oceanica*.
 
-Ce travail a été réalisé au GREAH – Université Le Havre Normandie dans le cadre du projet OCTOPUS. Il vise à comparer plusieurs architectures de deep learning pour identifier automatiquement les zones de *Posidonia oceanica* dans des images sous-marines.
+Ce travail a été réalisé au GREAH – Université Le Havre Normandie dans le cadre de mon stage de fin d'étude. Il vise à comparer plusieurs architectures de deep learning pour identifier automatiquement les zones de *Posidonia oceanica* dans des images sous-marines.
 
 ## Objectifs
 
@@ -18,20 +18,23 @@ Ce travail a été réalisé au GREAH – Université Le Havre Normandie dans le
 
 ## Jeu de données
 
-Le jeu de données utilisé au cours du stage a été fourni par le GREAH pour les expérimentations de segmentation de *Posidonia oceanica*.
+Le jeu de données utilisé au cours du stage a été fourni par l'Universitat de les Illes
+Balears (UIB). Les images ont été acquises dans trois zones de Majorque qui sont **Valldemossa**,
+**Palma Bay** et **Cala Blava** à l'aide de plateformes robotiques sous-marines équipées de
+caméras orientées vers le fond marin.
 
-Les travaux de Martin-Abadal et al. décrivent des campagnes d'acquisition réalisées par le groupe Systems, Robotics & Vision (SRV) de l'Universitat de les Illes Balears (UIB), notamment à Palma Bay, Cala Blava et Valldemossa, à Majorque. Les acquisitions ont été réalisées avec le Turbot AUV, un véhicule de type SPARUS II, équipé de caméras orientées vers le fond marin.
+Il contient **470 couples image–masque** en RGB, de résolution 360 × 480, annotés pixel
+par pixel :
 
-Une version publique des données associées à ces travaux est disponible sur Zenodo :
+| Sous-ensemble | Images | Usage |
+|---|---:|---|
+| Développement | 376 | entraînement et validation |
+| Test | 94 | évaluation finale, jamais utilisé pour la sélection |
 
-https://doi.org/10.5281/zenodo.4526867
+Cette répartition en deux dossiers distincts était déjà constituée à la réception des
+données ; elle n'a pas été construite dans le cadre de ce travail.
 
-Le jeu utilisé dans cette étude contient 470 couples image–masque :
-
-- 376 images pour le développement, utilisées pour l'entraînement et la validation ;
-- 94 images pour le test indépendant.
-
-L'organisation des données utilisée dans ce projet est la suivante :
+**Organisation des données :**
 
 ```text
 Dataset/
@@ -43,23 +46,8 @@ Dataset/
     └── gt_images/
 ```
 
-Les données brutes ne sont pas dupliquées dans ce dépôt. Elles doivent être obtenues auprès de la source d'origine ou des responsables des données, puis organisées selon cette structure.
-
-> **Note :** le jeu de 470 images utilisé pendant le stage a été fourni dans cette organisation par le GREAH. Le lien Zenodo correspond à une version publique des données associées aux travaux de Martin-Abadal et al. L'équivalence exacte entre les deux jeux doit encore être confirmée.
-
-## Références du jeu de données
-
-Martin-Abadal, M., Guerrero-Font, E., Bonin-Font, F. & Gonzalez-Cid, Y. (2018).  
-**Deep Semantic Segmentation in an AUV for Online Posidonia Oceanica Meadows Identification.**  
-IEEE Access, 6, 60956–60967.  
-https://doi.org/10.1109/ACCESS.2018.2875412
-
-Dataset associé :
-
-Martin-Abadal, M., Guerrero-Font, E., Bonin-Font, F. & Gonzalez-Cid, Y.  
-**Underwater images containing Posidonia Oceanica.**  
-Zenodo.  
-https://doi.org/10.5281/zenodo.4526867
+Les données ne sont pas redistribuées dans ce dépôt. Elles doivent être obtenues auprès
+des responsables des données, puis organisées selon cette arborescence.
 
 ## Architectures étudiées
 
