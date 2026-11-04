@@ -36,7 +36,7 @@ from transformers import SegformerForSemanticSegmentation
 # CONFIG (s'adapte aux chemins)
 # ----------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
-MODELS_DIR   = BASE_DIR / "predictions" / "models"
+MODELS_DIR = Path(os.environ.get("MODELS_DIR", BASE_DIR / "models"))
 TESTING_IMGS = BASE_DIR / "Dataset" / "testing" / "images"
 TESTING_MSKS = BASE_DIR / "Dataset" / "testing" / "gt_images"
 TRAINING_IMGS = BASE_DIR / "Dataset" / "training" / "images"
@@ -2717,9 +2717,9 @@ def predict():
     # ==========================================================
 
     if not selected_models:
-        selected_models = list(
-            MODELS_CONFIG.keys()
-        )
+        return jsonify({
+            "error": "Veuillez sélectionner au moins un modèle."
+        }), 400
 
     active_models = {}
 
@@ -2748,6 +2748,9 @@ def predict():
     # ==========================================================
     file = request.files['image']
     pil_orig = Image.open(file.stream).convert("RGB")
+
+    # Dimensions originales de l'image reçue
+    orig_w, orig_h = pil_orig.size
 
     # Image éventuellement prétraitée pour l'inférence
     pil_for_inference = apply_pipeline_preprocess(
@@ -3372,7 +3375,7 @@ def predict():
             gt_ensemble_rgb
         )
 
-        results.append({
+    results.append({
         "name": ensemble_label,
 
         "ground_truth": (
@@ -3453,6 +3456,8 @@ def predict():
     # ==========================================================
     return jsonify({
         'original': orig_b64,
+        'original_width': orig_w,
+        'original_height': orig_h,
         'preprocessed': preprocessed_b64,
         'inference_preprocess': inference_preprocess,
         'inference_preprocess_label': (
@@ -4356,4 +4361,6 @@ def _run_evaluate_impl():
 
 
 if __name__ == '__main__':
-    app.run(debug=False, port=5000)
+        app.run(debug=False,
+            host=os.environ.get("FLASK_HOST", "127.0.0.1"),
+            port=5000)

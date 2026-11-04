@@ -41,6 +41,7 @@ Thumbs.db
 # Données locales
 data/
 dataset/
+Dataset/
 datasets/
 
 # Résultats temporaires
@@ -48,6 +49,7 @@ outputs/
 runs/
 checkpoints/
 predictions/
+saved_segmentations/
 temp/
 tmp/
 

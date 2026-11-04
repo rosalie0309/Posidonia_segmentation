@@ -227,6 +227,16 @@
     color: var(--teal-bright); margin-bottom: 0.6rem;
   }
 
+  .image-dimensions {
+    margin-top: 0.25rem;
+    margin-bottom: 0.5rem;
+
+    font-family: 'Space Mono', monospace;
+    font-size: 0.65rem;
+
+    color: var(--text-dim);
+  }
+
   .metrics {
     display: flex; gap: 0.5rem; flex-wrap: wrap;
   }
@@ -670,6 +680,17 @@ const cardsGrid  = document.getElementById('cards-grid');
 
 let selectedFile = null;
 
+function updateRunButtonState() {
+  const hasImage = selectedFile !== null;
+
+  const hasModel =
+    document.querySelectorAll(
+      'input[name="selected_models"]:checked'
+    ).length > 0;
+
+  runBtn.disabled = !(hasImage && hasModel);
+}
+
 function preprocessLabel(value) {
   if (value === 'clahe') {
     return 'CLAHE';
@@ -736,7 +757,7 @@ function setFile(f) {
 
   updatePreprocessNote();
 
-  runBtn.disabled = false;
+  updateRunButtonState();
 }
 
 function setThreshold(val) {
@@ -759,28 +780,48 @@ function renderModelCheckboxes(models, thresholds = {}) {
 
   models.forEach((name, idx) => {
     const div = document.createElement('div');
-    div.style.cssText = 'display:flex; align-items:center; gap:0.5rem; margin-bottom:0.4rem;';
+
+    div.style.cssText =
+      'display:flex; align-items:center; gap:0.5rem; margin-bottom:0.4rem;';
 
     const input = document.createElement('input');
+
     input.type = 'checkbox';
     input.name = 'selected_models';
     input.value = name;
-    input.checked = true;
+
+    // Aucun modèle sélectionné au démarrage
+    input.checked = false;
+
     input.id = `chk-model-${idx}`;
-    input.style.cssText = 'accent-color:var(--teal-bright); width:14px; height:14px;';
+
+    input.style.cssText =
+      'accent-color:var(--teal-bright); width:14px; height:14px;';
+
+    input.addEventListener(
+      'change',
+      updateRunButtonState
+    );
 
     const label = document.createElement('label');
     label.htmlFor = input.id;
-    label.style.cssText = 'font-size:0.78rem; cursor:pointer;';
-    label.appendChild(document.createTextNode(name + ' '));
+    label.style.cssText =
+      'font-size:0.78rem; cursor:pointer;';
+
+    label.appendChild(
+      document.createTextNode(name + ' ')
+    );
 
     const span = document.createElement('span');
     span.className = 'model-threshold-value';
     span.dataset.modelName = name;
-    span.style.cssText = 'font-size:0.65rem; color:var(--text-dim);';
+
+    span.style.cssText =
+      'font-size:0.65rem; color:var(--text-dim);';
 
     if (thresholds[name] !== undefined) {
-      span.textContent = `(seuil=${Number(thresholds[name]).toFixed(2)})`;
+      span.textContent =
+        `(seuil=${Number(thresholds[name]).toFixed(2)})`;
     }
 
     label.appendChild(span);
@@ -788,6 +829,8 @@ function renderModelCheckboxes(models, thresholds = {}) {
     div.appendChild(label);
     container.appendChild(div);
   });
+
+  updateRunButtonState();
 }
 
 function updateDisplayedThresholds() {
@@ -847,6 +890,16 @@ function formatUncertaintyMode(mode) {
     : 'standard centrée sur 0.5';
 }
 
+function safeFixed(value, digits = 2) {
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return '—';
+  }
+
+  return n.toFixed(digits);
+}
+
 // ── lancement ──
 runBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
@@ -891,19 +944,30 @@ fd.append(
 
     const data = await resp.json();
 
+    console.log("Résultats reçus :", data.results);
+    console.log(
+      "Ensemble :",
+      data.results.find(r => r.name.startsWith("Ensemble"))
+    );
+
     if (data.error) {
       alert(data.error);
       return;
     }
 
-    const panels = [
-      {
-        title: 'Image originale',
-        img: data.original,
-        metrics: null,
-        delay: 0
-      }
-    ];
+  const panels = [
+    {
+      title: 'Image originale',
+      img: data.original,
+      metrics: null,
+
+      // Dimensions originales reçues par l'application
+      original_height: data.original_height,
+      original_width: data.original_width,
+
+      delay: 0
+    }
+  ];
 
     if (data.preprocessed && data.inference_preprocess !== 'none') {
       panels.push({
@@ -947,6 +1011,11 @@ fd.append(
         posidonia_cover: r.posidonia_cover_percent,
         inference_preprocess_label: data.inference_preprocess_label,
 
+        // Résolution réellement utilisée
+        input_height: r.input_height,
+        input_width: r.input_width,
+        resolution_type: r.resolution_type,
+
         delay: i + (data.has_gt ? 2 : 1),
         ensemble: isEnsemble
       });
@@ -984,13 +1053,48 @@ fd.append(
         if (p.uncertainty.type === 'single_model_dirichlet') {
           uncertaintyHtml = `
             <div class="uncertainty-box">
-              <div><strong>Prétraitement image :</strong> ${p.inference_preprocess_label}</div>
-              <div><strong>Mode seuil :</strong> ${thresholdModeText}</div>
-              <div><strong>Seuil utilisé :</strong> ${formatThresholdUsed(p.threshold_used)}</div>
-              <div><strong>Mode incertitude :</strong> ${uncertaintyModeText}</div>
-              <div><strong>Couverture posidonie :</strong> ${p.posidonia_cover.toFixed(2)} %</div>
-              <div><strong>Incertitude Dirichlet moyenne :</strong> ${p.uncertainty.dirichlet_uncertainty_norm_mean.toFixed(4)}</div>
-              <div><strong>Pixels incertains Dirichlet :</strong> ${p.uncertainty.dirichlet_uncertain_pixel_percent.toFixed(2)} %</div>
+
+              <div>
+                <strong>Prétraitement image :</strong>
+                ${p.inference_preprocess_label}
+              </div>
+
+              <div>
+                <strong>Mode seuil :</strong>
+                ${thresholdModeText}
+              </div>
+
+              <div>
+                <strong>Seuil utilisé :</strong>
+                ${formatThresholdUsed(p.threshold_used)}
+              </div>
+
+              <div>
+                <strong>Mode incertitude :</strong>
+                ${uncertaintyModeText}
+              </div>
+
+              <div>
+                <strong>Couverture posidonie :</strong>
+                ${safeFixed(p.posidonia_cover, 2)} %
+              </div>
+
+              <div>
+                <strong>Incertitude Dirichlet moyenne :</strong>
+                ${safeFixed(
+                  p.uncertainty.dirichlet_uncertainty_norm_mean,
+                  4
+                )}
+              </div>
+
+              <div>
+                <strong>Pixels incertains Dirichlet :</strong>
+                ${safeFixed(
+                  p.uncertainty.dirichlet_uncertain_pixel_percent,
+                  2
+                )} %
+              </div>
+
             </div>
           `;
         }
@@ -998,15 +1102,67 @@ fd.append(
         if (p.uncertainty.type === 'ensemble_dirichlet') {
           uncertaintyHtml = `
             <div class="uncertainty-box">
-              <div><strong>Mode seuil :</strong> ${thresholdModeText}</div>
-              <div><strong>Seuil utilisé :</strong> ${formatThresholdUsed(p.threshold_used)}</div>
-              <div><strong>Mode incertitude :</strong> ${uncertaintyModeText}</div>
-              <div><strong>Couverture posidonie :</strong> ${p.posidonia_cover.toFixed(2)} %</div>
-              <div><strong>Accord moyen :</strong> ${p.uncertainty.agreement_percent.toFixed(2)} %</div>
-              <div><strong>Désaccord moyen :</strong> ${p.uncertainty.disagreement_percent.toFixed(2)} %</div>
-              <div><strong>Pixels en désaccord :</strong> ${p.uncertainty.uncertain_pixel_percent.toFixed(2)} %</div>
-              <div><strong>Incertitude Dirichlet moyenne :</strong> ${p.uncertainty.dirichlet_uncertainty_norm_mean.toFixed(4)}</div>
-              <div><strong>Pixels incertains Dirichlet :</strong> ${p.uncertainty.dirichlet_uncertain_pixel_percent.toFixed(2)} %</div>
+
+              <div>
+                <strong>Mode seuil :</strong>
+                ${thresholdModeText}
+              </div>
+
+              <div>
+                <strong>Seuil utilisé :</strong>
+                ${formatThresholdUsed(p.threshold_used)}
+              </div>
+
+              <div>
+                <strong>Mode incertitude :</strong>
+                ${uncertaintyModeText}
+              </div>
+
+              <div>
+                <strong>Couverture posidonie :</strong>
+                ${safeFixed(p.posidonia_cover, 2)} %
+              </div>
+
+              <div>
+                <strong>Accord des décisions individuelles :</strong>
+                ${safeFixed(
+                  p.uncertainty.agreement_percent,
+                  2
+                )} %
+              </div>
+
+              <div>
+                <strong>Désaccord inter-modèles :</strong>
+                ${safeFixed(
+                  p.uncertainty.disagreement_percent,
+                  2
+                )} %
+              </div>
+
+              <div>
+                <strong>Pixels en désaccord :</strong>
+                ${safeFixed(
+                  p.uncertainty.uncertain_pixel_percent,
+                  2
+                )} %
+              </div>
+
+              <div>
+                <strong>Incertitude Dirichlet moyenne :</strong>
+                ${safeFixed(
+                  p.uncertainty.dirichlet_uncertainty_norm_mean,
+                  4
+                )}
+              </div>
+
+              <div>
+                <strong>Pixels incertains Dirichlet :</strong>
+                ${safeFixed(
+                  p.uncertainty.dirichlet_uncertain_pixel_percent,
+                  2
+                )} %
+              </div>
+
             </div>
           `;
         }
@@ -1044,17 +1200,42 @@ fd.append(
             ` : ''}
           </div>
 
-          <div class="card-body">
-            <div class="card-title">${p.title}</div>
-            ${metricsHtml}
-            ${uncertaintyHtml}
+        <div class="card-body">
+
+          <div class="card-title">${p.title}</div>
+
+          <div class="image-dimensions">
+            ${
+              p.resolution_type === 'fusion'
+              ? 'Résolution de fusion'
+              : 'Résolution du pipeline'
+            } :
+            ${p.input_height} × ${p.input_width}
           </div>
+
+          ${metricsHtml}
+          ${uncertaintyHtml}
+
+        </div>
         `;
       } else {
         card.innerHTML = `
           <img src="data:image/png;base64,${p.img}" alt="${p.title}">
           <div class="card-body">
+
             <div class="card-title">${p.title}</div>
+
+            ${
+              p.original_height && p.original_width
+              ? `
+                <div class="image-dimensions">
+                  Dimensions originales :
+                  ${p.original_height} × ${p.original_width}
+                </div>
+              `
+              : ''
+            }
+
             ${metricsHtml}
           </div>
         `;
