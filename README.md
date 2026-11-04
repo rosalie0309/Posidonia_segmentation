@@ -248,7 +248,7 @@ partir des résultats effectivement obtenus.
 
 ### 6. Lancer l'application Web
 
-Placer d'abord les modèles dans un dossier `models/` à la racine du projet, au même niveau que `Application_web/` et `Dataset/`. Chaque modèle comprend deux fichiers : le poids (`nom_best.pth`) et ses métadonnées (`nom_metadata.json`). Les `.pth` ne sont pas dans le dépôt et doivent être obtenus auprès de l'auteure ou alors vous pouvez refaire l'entrainement en utilisant les notebooks afin d'obtenir les modèles que vous pouvez évaluer.
+Placer d'abord les modèles dans un dossier `models/` à la racine du projet, au même niveau que `Application_web/` et `Dataset/`. Chaque modèle comprend deux fichiers : le poids (`nom_best.pth`) et ses métadonnées (`nom_metadata.json`). Les `.pth` ne sont pas dans le dépôt et doivent être obtenus auprès de l'auteure ou alors vous pouvez refaire l'entrainement en utilisant les notebooks afin d'obtenir les modèles que vous pouvez évaluer. Les fichiers `*_metadata.json` fournis dans le dépôt se trouvent dans `Application_web/models/` : ils doivent être copiés dans `models/` (à la racine), à côté des poids correspondants.
 
 Puis, depuis la racine du projet :
 
