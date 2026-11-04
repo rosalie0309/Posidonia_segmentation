@@ -1,8 +1,8 @@
-# Project de Stage -- Posidonia oceanica Semantic Segmentation
+# Projet de Stage : Posidonia oceanica Semantic Segmentation
 
 Projet de segmentation sémantique d'images sous-marines pour la détection de *Posidonia oceanica*.
 
-Ce travail a été réalisé au GREAH – Université Le Havre Normandie dans le cadre de mon stage de fin d'étude. Il vise à comparer plusieurs architectures de deep learning pour identifier automatiquement les zones de *Posidonia oceanica* dans des images sous-marines.
+Ce travail a été réalisé au GREAH de l'Université Le Havre Normandie dans le cadre de mon stage de fin d'études. Il vise à comparer plusieurs architectures de deep learning pour identifier automatiquement les zones de *Posidonia oceanica* dans des images sous-marines.
 
 ## Objectifs
 
@@ -248,8 +248,7 @@ partir des résultats effectivement obtenus.
 
 ### 6. Lancer l'application Web
 
-Placer d'abord les modèles dans un dossier `models/` à la racine du projet, au même niveau que `Application_web/` et `Dataset/`. Chaque modèle comprend deux fichiers : le poids (`nom_best.pth`) et ses métadonnées (`nom_metadata.json`). Les `.pth` ne sont pas dans le dépôt et doivent être obtenus auprès de l'auteure ou alors vous pouvez refaire l'entrainement en utilisant les notebooks afin d'obtenir les modèles que vous pouvez évaluer. Les fichiers `*_metadata.json` fournis dans le dépôt se trouvent dans `Application_web/models/` : ils doivent être copiés dans `models/` (à la racine), à côté des poids correspondants.
-
+Placer d'abord les modèles dans un dossier `models/` à la racine du projet, au même niveau que `Application_web/` et `Dataset/`. Chaque modèle comprend deux fichiers : le poids (`nom_best.pth`) et ses métadonnées (`nom_metadata.json`). Les `.pth` ne sont pas dans le dépôt et doivent être obtenus auprès de l'auteure ou alors vous pouvez refaire l'entraînement en utilisant les notebooks afin d'obtenir les modèles que vous pouvez évaluer. Les fichiers `*_metadata.json` fournis dans le dépôt se trouvent dans `Application_web/models/` : ils doivent être copiés dans `models/` (à la racine), à côté des poids correspondants.
 Puis, depuis la racine du projet :
 
 ```bash
