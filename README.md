@@ -113,20 +113,23 @@ Application_web/
 
 ## Structure du dépôt
 
-La structure principale du projet est actuellement :
+La structure principale du projet est la suivante :
 
 ```text
-Posidonia_Oceanica_Detection_Project/
-├── Application_web/
-├── Dataset/
+Posidonia_segmentation/
+├── Application_web/      application Flask (app.py, pipeline_utils.py, templates/)
+├── segformer/            fichiers des expériences SegFormer (b0, b1, b2)
+├── models/               à créer en local : poids .pth et fichiers *_metadata.json
+├── Dataset/              à créer en local : données
 ├── implementation_segformerb_tutoriel.ipynb
 ├── implementation_vgg16_fcn8.ipynb
+├── statistical_analysis_segformer.ipynb
 ├── .gitignore
 ├── README.md
 └── requirements.txt
 ```
 
-Le dossier `Dataset/` peut être conservé localement tout en étant exclu du suivi Git à l'aide du fichier `.gitignore`.
+Les dossiers `models/` et `Dataset/` sont conservés localement et exclus du suivi Git : les poids (`.pth`) dépassent la limite de taille de GitHub, et les données ne sont pas redistribuées.
 
 ## Environnement logiciel
 
@@ -155,8 +158,8 @@ Les versions exactes des dépendances doivent être enregistrées dans le fichie
 ### 1. Cloner le dépôt
 
 ```bash
-git clone https://github.com/rosalie0309/Project_OCTOPUS
-cd Posidonia_Oceanica_Detection_Project
+git clone https://github.com/rosalie0309/Posidonia_segmentation
+cd Posidonia_segmentation
 ```
 
 ### 2. Créer un environnement virtuel
@@ -191,10 +194,14 @@ Dataset/
 ├── training/
 │   ├── images/
 │   └── gt_images/
-└── testing/
-    ├── images/
-    └── gt_images/
+├── testing/
+│   ├── images/
+│   └── gt_images/
+├── fold_csvs/                 (fold0_val.csv à fold4_val.csv)
+└── val_split_stratified.csv
 ```
+
+Les dossiers `training/` et `testing/` suffisent pour segmenter des images. Les fichiers `fold_csvs/` et `val_split_stratified.csv` sont nécessaires à la page d'évaluation (validation croisée).
 
 ### 5. Exécuter les notebooks
 
@@ -241,15 +248,25 @@ partir des résultats effectivement obtenus.
 
 ### 6. Lancer l'application Web
 
-Depuis la racine du projet :
+Placer d'abord les modèles dans un dossier `models/` à la racine du projet, au même niveau que `Application_web/` et `Dataset/`. Chaque modèle comprend deux fichiers : le poids (`nom_best.pth`) et ses métadonnées (`nom_metadata.json`). Les `.pth` ne sont pas dans le dépôt et doivent être obtenus auprès de l'auteure ou alors vous pouvez refaire l'entrainement en utilisant les notebooks afin d'obtenir les modèles que vous pouvez évaluer.
+
+Puis, depuis la racine du projet :
 
 ```bash
 cd Application_web
 python app.py
 ```
 
-L'application est ensuite accessible à l'adresse locale indiquée dans le terminal.
-Pour les modèles ils faut vous rassurer qu'ils sont dans un dossier ```models``` qui doit se trouver au même niveau hiérarchique que ```Dataset```
+L'application est ensuite accessible à l'adresse locale indiquée dans le terminal (par défaut `http://127.0.0.1:5000`).
+
+Deux variables d'environnement optionnelles permettent d'adapter le lancement :
+
+| Variable | Rôle | Valeur par défaut |
+|---|---|---|
+| `MODELS_DIR` | dossier contenant les modèles | `models/` à la racine du projet |
+| `FLASK_HOST` | adresse d'écoute du serveur | `127.0.0.1` |
+
+Au premier chargement d'un modèle SegFormer, une connexion Internet est nécessaire : l'encodeur pré-entraîné `nvidia/mit-b0`, `b1` ou `b2` est téléchargé depuis Hugging Face avant d'être remplacé par les poids du checkpoint.
 
 ## Génération du fichier requirements
 
