@@ -1,0 +1,9 @@
+Dataset
+models
+.git
+.venv
+**/__pycache__
+Application_web/saved_segmentations
+Application_web/models
+*.ipynb
+*.pth
