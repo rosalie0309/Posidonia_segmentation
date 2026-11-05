@@ -248,7 +248,7 @@ partir des résultats effectivement obtenus.
 
 ### 6. Lancer l'application Web
 
-Placer d'abord les modèles dans un dossier `models/` à la racine du projet, au même niveau que `Application_web/` et `Dataset/`. Chaque modèle comprend deux fichiers : le poids (`nom_best.pth`) et ses métadonnées (`nom_metadata.json`). Les `.pth` ne sont pas dans le dépôt et doivent être obtenus auprès de l'auteure ou alors vous pouvez refaire l'entraînement en utilisant les notebooks afin d'obtenir les modèles que vous pouvez évaluer. Les fichiers `*_metadata.json` fournis dans le dépôt se trouvent dans `Application_web/models/` : ils doivent être copiés dans `models/` (à la racine), à côté des poids correspondants.
+Placer d'abord les modèles dans un dossier `models/` à la racine du projet, au même niveau que `Application_web/` et `Dataset/`. Chaque modèle comprend deux fichiers : le poids (`nom_best.pth`) et ses métadonnées (`nom_metadata.json`). Les `.pth` ne sont pas dans le dépôt et doivent être obtenus auprès de l'auteure ou alors vous pouvez refaire l'entraînement en utilisant les notebooks afin d'obtenir les modèles que vous pouvez évaluer. Les fichiers `*_metadata.json` fournis dans le dépôt se trouvent déjà dans `models/` : il suffit d'y ajouter les poids `.pth` correspondants.
 Puis, depuis la racine du projet :
 
 ```bash
@@ -266,6 +266,29 @@ Deux variables d'environnement optionnelles permettent d'adapter le lancement :
 | `FLASK_HOST` | adresse d'écoute du serveur | `127.0.0.1` |
 
 Au premier chargement d'un modèle SegFormer, une connexion Internet est nécessaire : l'encodeur pré-entraîné `nvidia/mit-b0`, `b1` ou `b2` est téléchargé depuis Hugging Face avant d'être remplacé par les poids du checkpoint.
+
+### 7. Lancer l'application avec Docker (optionnel)
+
+L'application peut être exécutée dans un conteneur Docker. Cette procédure a été testée sous Linux (GitHub Codespaces). Les poids du modèle et les données ne sont pas copiés dans l'image : ils sont branchés par des volumes.
+
+Construire l'image, depuis la racine du projet :
+
+```bash
+docker build -t octopus-posidonia .
+```
+
+Placer au moins un modèle (fichier `.pth` et son fichier `_metadata.json`) dans `models/`, puis lancer le conteneur :
+
+```bash
+docker run --rm -p 5000:5000 \
+  -v "$PWD/models:/app/models" \
+  -v hf_cache:/hf_cache \
+  octopus-posidonia
+```
+
+L'application est ensuite accessible sur `http://localhost:5000`. Pour afficher les faux positifs, les faux négatifs et les métriques, ajouter aussi le jeu de données avec `-v "$PWD/Dataset:/app/Dataset"`.
+
+Le fichier `requirements-docker.txt` contient uniquement les dépendances nécessaires à l'application, et PyTorch est installé en version CPU depuis le `Dockerfile`.
 
 ## Génération du fichier requirements
 
